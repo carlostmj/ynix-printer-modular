@@ -138,6 +138,10 @@ class ThermalLabelApp:
         self.loading_page_settings = False
         self.page_adjustments: dict[int, dict[str, object]] = {}
         self.default_page_adjustment: dict[str, object] | None = None
+        self.undo_stack: list[dict[str, object]] = []
+        self.redo_stack: list[dict[str, object]] = []
+        self.last_history_snapshot: dict[str, object] | None = None
+        self.history_paused = False
         self.drag_start = None
         self.resize_start = None
         self.rotate_start = None
@@ -178,6 +182,11 @@ class ThermalLabelApp:
         toolbar.pack(fill="x", pady=(0, 6))
         ttk.Button(toolbar, text="Abrir arquivos", style="Accent.TButton", command=self.pick_files).pack(side="left")
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=10)
+        self.undo_button = ttk.Button(toolbar, text="Desfazer", command=self.undo_edit)
+        self.undo_button.pack(side="left")
+        self.redo_button = ttk.Button(toolbar, text="Refazer", command=self.redo_edit)
+        self.redo_button.pack(side="left", padx=(6, 10))
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=(0, 10))
         ttk.Button(toolbar, text="Anterior", command=self.prev_page).pack(side="left")
         ttk.Button(toolbar, text="Próxima", command=self.next_page).pack(side="left", padx=(6, 0))
         self.page_info = ttk.Label(toolbar, text="Página 0/0", style="Muted.TLabel")
@@ -505,6 +514,9 @@ class ThermalLabelApp:
         menubar.add_cascade(label="Impressão", menu=print_menu)
 
         view_menu = tk.Menu(menubar, tearoff=False)
+        view_menu.add_command(label="Desfazer", accelerator="Ctrl+Z", command=self.undo_edit)
+        view_menu.add_command(label="Refazer", accelerator="Ctrl+Y", command=self.redo_edit)
+        view_menu.add_separator()
         view_menu.add_command(label="Página anterior", accelerator="Ctrl+←", command=self.prev_page)
         view_menu.add_command(label="Próxima página", accelerator="Ctrl+→", command=self.next_page)
         view_menu.add_separator()
@@ -526,6 +538,9 @@ class ThermalLabelApp:
         self.root.bind_all("<Control-Left>", lambda _event: self.prev_page())
         self.root.bind_all("<Control-Right>", lambda _event: self.next_page())
         self.root.bind_all("<Control-r>", lambda _event: self._toggle_preview_mode())
+        self.root.bind_all("<Control-z>", lambda _event: self.undo_edit())
+        self.root.bind_all("<Control-y>", lambda _event: self.redo_edit())
+        self.root.bind_all("<Control-Z>", lambda _event: self.redo_edit())
         self.root.bind_all("<Control-0>", lambda _event: self.reset_scale())
         self.root.bind_all("<Control-parenright>", lambda _event: self.reset_crop())
         self.root.bind_all("<Escape>", lambda _event: self._end_preview_action())
@@ -849,6 +864,86 @@ class ThermalLabelApp:
             "auto_rotate": bool(self.auto_rotate.get()),
         }
 
+    def _set_page_adjustment(self, adjustment: dict[str, object]) -> None:
+        self.history_paused = True
+        self.loading_page_settings = True
+        try:
+            self.margin_px.set(int(adjustment["margin_px"]))
+            self.offset_x_px.set(int(adjustment["offset_x_px"]))
+            self.offset_y_px.set(int(adjustment["offset_y_px"]))
+            self.scale_x_percent.set(int(adjustment["scale_x_percent"]))
+            self.scale_y_percent.set(int(adjustment["scale_y_percent"]))
+            self.scale_uniform_percent.set(int(adjustment["scale_uniform_percent"]))
+            self.rotation_degrees.set(int(adjustment["rotation_degrees"]))
+            self.crop_left_percent.set(int(adjustment.get("crop_left_percent", 0)))
+            self.crop_right_percent.set(int(adjustment.get("crop_right_percent", 0)))
+            self.crop_top_percent.set(int(adjustment.get("crop_top_percent", 0)))
+            self.crop_bottom_percent.set(int(adjustment.get("crop_bottom_percent", 0)))
+            self.fit_mode.set(str(adjustment["fit_mode"]))
+            self.auto_rotate.set(bool(adjustment["auto_rotate"]))
+        finally:
+            self.loading_page_settings = False
+            self.history_paused = False
+
+    def _reset_edit_history(self) -> None:
+        self.undo_stack = []
+        self.redo_stack = []
+        self.last_history_snapshot = self._current_page_adjustment()
+        self._update_history_buttons()
+
+    def _record_edit_history(self) -> None:
+        if self.history_paused:
+            return
+        snapshot = self._current_page_adjustment()
+        if self.last_history_snapshot is None:
+            self.last_history_snapshot = snapshot
+            self._update_history_buttons()
+            return
+        if snapshot == self.last_history_snapshot:
+            return
+        self.undo_stack.append(dict(self.last_history_snapshot))
+        if len(self.undo_stack) > 100:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+        self.last_history_snapshot = snapshot
+        self._update_history_buttons()
+
+    def _update_history_buttons(self) -> None:
+        if hasattr(self, "undo_button"):
+            self.undo_button.configure(state="normal" if self.undo_stack else "disabled")
+        if hasattr(self, "redo_button"):
+            self.redo_button.configure(state="normal" if self.redo_stack else "disabled")
+
+    def undo_edit(self) -> None:
+        if not self.undo_stack:
+            self.status_message.set("Nada para desfazer")
+            return
+        current = self._current_page_adjustment()
+        previous = self.undo_stack.pop()
+        self.redo_stack.append(current)
+        self._set_page_adjustment(previous)
+        self._save_current_page_adjustment()
+        self.last_history_snapshot = self._current_page_adjustment()
+        self._update_history_buttons()
+        self._update_calculated_px()
+        self.schedule_preview()
+        self.status_message.set("Ajuste desfeito")
+
+    def redo_edit(self) -> None:
+        if not self.redo_stack:
+            self.status_message.set("Nada para refazer")
+            return
+        current = self._current_page_adjustment()
+        next_adjustment = self.redo_stack.pop()
+        self.undo_stack.append(current)
+        self._set_page_adjustment(next_adjustment)
+        self._save_current_page_adjustment()
+        self.last_history_snapshot = self._current_page_adjustment()
+        self._update_history_buttons()
+        self._update_calculated_px()
+        self.schedule_preview()
+        self.status_message.set("Ajuste refeito")
+
     def _save_current_page_adjustment(self) -> None:
         if not self.page_sources or self.loading_page_settings:
             return
@@ -864,21 +959,10 @@ class ThermalLabelApp:
             if adjustment is None:
                 adjustment = default_adjustment
             if adjustment is not None:
-                self.margin_px.set(int(adjustment["margin_px"]))
-                self.offset_x_px.set(int(adjustment["offset_x_px"]))
-                self.offset_y_px.set(int(adjustment["offset_y_px"]))
-                self.scale_x_percent.set(int(adjustment["scale_x_percent"]))
-                self.scale_y_percent.set(int(adjustment["scale_y_percent"]))
-                self.scale_uniform_percent.set(int(adjustment["scale_uniform_percent"]))
-                self.rotation_degrees.set(int(adjustment["rotation_degrees"]))
-                self.crop_left_percent.set(int(adjustment.get("crop_left_percent", 0)))
-                self.crop_right_percent.set(int(adjustment.get("crop_right_percent", 0)))
-                self.crop_top_percent.set(int(adjustment.get("crop_top_percent", 0)))
-                self.crop_bottom_percent.set(int(adjustment.get("crop_bottom_percent", 0)))
-                self.fit_mode.set(str(adjustment["fit_mode"]))
-                self.auto_rotate.set(bool(adjustment["auto_rotate"]))
+                self._set_page_adjustment(adjustment)
         finally:
             self.loading_page_settings = False
+        self._reset_edit_history()
 
     def _settings_from_adjustment(self, adjustment: dict[str, object]) -> RenderSettings:
         width_px, height_px = self._canvas_size_px()
@@ -936,6 +1020,7 @@ class ThermalLabelApp:
             self.profile_tree.selection_set(profile.name)
             self.profile_tree.focus(profile.name)
             self.profile_tree.see(profile.name)
+        self._reset_edit_history()
         if refresh:
             self.schedule_preview()
 
@@ -1102,8 +1187,9 @@ class ThermalLabelApp:
         self.schedule_preview()
 
     def _on_render_setting_changed(self) -> None:
-        if self.syncing or self.loading_page_settings:
+        if self.syncing or self.loading_page_settings or self.history_paused:
             return
+        self._record_edit_history()
         self._save_current_page_adjustment()
         self._update_calculated_px()
         self.schedule_preview()
@@ -1225,6 +1311,7 @@ class ThermalLabelApp:
             self.status_message.set(f"{first} carregado - {len(self.page_sources)} página(s)")
         else:
             self.status_message.set("Nenhum arquivo carregado")
+        self._reset_edit_history()
         self.refresh_preview()
 
     def prev_page(self) -> None:

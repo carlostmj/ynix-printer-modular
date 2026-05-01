@@ -46,6 +46,8 @@ Com arquivo inicial:
 - `Ctrl+O`: abrir arquivos
 - `Ctrl+P`: imprimir página atual
 - `Ctrl+Shift+P`: imprimir todas as páginas
+- `Ctrl+Z`: desfazer ajuste
+- `Ctrl+Y` / `Ctrl+Shift+Z`: refazer ajuste
 - `Ctrl+←` / `Ctrl+→`: navegar páginas
 - `Ctrl+R`: alternar redimensionar/rotacionar
 - `Ctrl+0`: redefinir escala e rotação
