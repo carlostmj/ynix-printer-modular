@@ -121,7 +121,6 @@ class ThermalLabelApp:
         self.auto_rotate = tk.BooleanVar(value=True)
         self.fit_mode = tk.StringVar(value="contain")
         self.page_range = tk.StringVar(value="")
-        self.new_profile_name = tk.StringVar(value="")
         self.profile_status = tk.StringVar(value="")
 
         self.files = [normalize_input_path(f) for f in files if normalize_input_path(f).is_file()]
@@ -306,14 +305,11 @@ class ThermalLabelApp:
         ttk.Label(measure_box, textvariable=self.calculated_px, style="Value.TLabel").grid(row=measure_row, column=1, sticky="w", pady=4)
         measure_box.columnconfigure(1, weight=1)
 
-        save_box = ttk.LabelFrame(profiles_tab, text="Salvar configurações", padding=10)
-        save_box.pack(fill="x", pady=(12, 0))
-        ttk.Label(save_box, text="Nome do perfil").grid(row=0, column=0, sticky="w")
-        ttk.Entry(save_box, textvariable=self.new_profile_name).grid(row=0, column=1, sticky="ew", padx=(8, 0))
-        ttk.Button(save_box, text="Salvar perfil atual", command=self.save_current_profile).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Button(save_box, text="Excluir perfil salvo", command=self.delete_selected_profile).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Label(save_box, textvariable=self.profile_status, style="Muted.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        save_box.columnconfigure(1, weight=1)
+        profile_actions = ttk.Frame(profiles_tab, style="App.TFrame")
+        profile_actions.pack(fill="x", pady=(12, 0))
+        ttk.Button(profile_actions, text="Novo perfil...", command=self.open_profile_window).pack(side="left", fill="x", expand=True)
+        ttk.Button(profile_actions, text="Excluir salvo", command=self.delete_selected_profile).pack(side="left", fill="x", expand=True, padx=(8, 0))
+        ttk.Label(profiles_tab, textvariable=self.profile_status, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
 
         grid = ttk.Frame(setup_tab)
         grid.pack(fill="x")
@@ -961,24 +957,90 @@ class ThermalLabelApp:
                 self.profile_tree.focus(selected_name)
                 self.profile_tree.see(selected_name)
 
-    def save_current_profile(self) -> None:
-        name = self.new_profile_name.get().strip()
+    def open_profile_window(self) -> None:
+        if hasattr(self, "profile_window") and self.profile_window.winfo_exists():
+            self.profile_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Novo perfil")
+        window.geometry("420x300")
+        window.transient(self.root)
+        window.grab_set()
+        self.profile_window = window
+
+        name_var = tk.StringVar(value="")
+        width_var = tk.DoubleVar(value=round(self.width_mm, 2))
+        height_var = tk.DoubleVar(value=round(self.height_mm, 2))
+        dpi_var = tk.IntVar(value=max(1, int(self.dpi.get())))
+        margin_var = tk.DoubleVar(value=round(px_to_mm(max(0, int(self.margin_px.get())), max(1, int(self.dpi.get()))), 2))
+        status_var = tk.StringVar(value="Baseado nas medidas atuais.")
+
+        container = ttk.Frame(window, padding=12, style="App.TFrame")
+        container.pack(fill="both", expand=True)
+        ttk.Label(container, text="Novo perfil", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(container, text="Salve uma medida para reutilizar depois.", style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
+
+        form = ttk.Frame(container, style="App.TFrame")
+        form.pack(fill="x")
+        ttk.Label(form, text="Nome").grid(row=0, column=0, sticky="w", pady=4)
+        name_entry = ttk.Entry(form, textvariable=name_var)
+        name_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(form, text="Largura (mm)").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Spinbox(form, from_=10, to=1000, increment=0.5, textvariable=width_var, width=12).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Altura (mm)").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Spinbox(form, from_=10, to=1500, increment=0.5, textvariable=height_var, width=12).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="DPI").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Spinbox(form, from_=150, to=600, increment=1, textvariable=dpi_var, width=12).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Margem (mm)").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Spinbox(form, from_=0, to=50, increment=0.1, textvariable=margin_var, width=12).grid(row=4, column=1, sticky="w", pady=4)
+        form.columnconfigure(1, weight=1)
+
+        ttk.Label(container, textvariable=status_var, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
+        actions = ttk.Frame(container, style="App.TFrame")
+        actions.pack(fill="x", side="bottom", pady=(14, 0))
+        ttk.Button(actions, text="Cancelar", command=window.destroy).pack(side="right")
+        ttk.Button(actions, text="Salvar", style="Accent.TButton", command=lambda: self.save_profile_from_window(window, name_var, width_var, height_var, dpi_var, margin_var, status_var)).pack(side="right", padx=(0, 8))
+        name_entry.focus_set()
+
+    def save_profile_from_window(
+        self,
+        window: tk.Toplevel,
+        name_var: tk.StringVar,
+        width_var: tk.DoubleVar,
+        height_var: tk.DoubleVar,
+        dpi_var: tk.IntVar,
+        margin_var: tk.DoubleVar,
+        status_var: tk.StringVar,
+    ) -> None:
+        name = name_var.get().strip()
         if not name:
-            self.profile_status.set("Digite um nome para o perfil.")
+            status_var.set("Digite um nome para o perfil.")
             return
         if is_builtin_profile(name):
-            self.profile_status.set("Use outro nome: perfis padrão não são sobrescritos.")
+            status_var.set("Use outro nome: perfis padrão não são sobrescritos.")
             return
-        margin_mm = px_to_mm(max(0, int(self.margin_px.get())), max(1, int(self.dpi.get())))
-        profile = LabelProfile(name, float(self.width_mm), float(self.height_mm), int(self.dpi.get()), margin_mm)
+        try:
+            width_mm = float(width_var.get())
+            height_mm = float(height_var.get())
+            dpi = int(dpi_var.get())
+            margin_mm = float(margin_var.get())
+        except (tk.TclError, ValueError):
+            status_var.set("Revise os valores numéricos.")
+            return
+        if width_mm <= 0 or height_mm <= 0 or dpi <= 0 or margin_mm < 0:
+            status_var.set("Medidas, DPI e margem precisam ser válidos.")
+            return
+        profile = LabelProfile(name, width_mm, height_mm, dpi, margin_mm)
         try:
             save_custom_profile(profile)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             messagebox.showerror("Perfis", f"Não foi possível salvar o perfil:\n{exc}")
             return
         self.profile_status.set(f"Perfil salvo: {name}")
         self._refresh_profile_controls(name)
         self.apply_profile(name)
+        window.destroy()
 
     def delete_selected_profile(self) -> None:
         selection = self.profile_tree.selection()
