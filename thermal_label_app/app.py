@@ -176,28 +176,31 @@ class ThermalLabelApp:
         main.pack(fill="both", expand=True)
 
         toolbar = ttk.Frame(main, style="Toolbar.TFrame")
-        toolbar.pack(fill="x", pady=(0, 10))
+        toolbar.pack(fill="x", pady=(0, 6))
         ttk.Button(toolbar, text="Abrir arquivos", style="Accent.TButton", command=self.pick_files).pack(side="left")
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(toolbar, text="Anterior", command=self.prev_page).pack(side="left")
         ttk.Button(toolbar, text="Próxima", command=self.next_page).pack(side="left", padx=(6, 0))
         self.page_info = ttk.Label(toolbar, text="Página 0/0", style="Muted.TLabel")
         self.page_info.pack(side="left", padx=12)
-
-        quick_controls = ttk.Frame(toolbar, style="Toolbar.TFrame")
-        quick_controls.pack(side="left", fill="x", expand=True, padx=(4, 12))
-        ttk.Label(quick_controls, text="Perfil").pack(side="left")
-        self.profile_combo = ttk.Combobox(quick_controls, textvariable=self.profile_name, values=profile_names(), state="readonly", width=9)
-        self.profile_combo.pack(side="left", padx=(4, 10))
-        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_combo_select)
-        ttk.Label(quick_controls, text="Impressora").pack(side="left")
-        printer_values = self.detected_printers or [self.printer_name.get()]
-        self.top_printer_combo = ttk.Combobox(quick_controls, textvariable=self.printer_name, values=printer_values, state="readonly", width=22)
-        self.top_printer_combo.pack(side="left", padx=(4, 10), fill="x", expand=True)
-        ttk.Label(quick_controls, text="Qualidade").pack(side="left")
-        self.top_quality_combo = ttk.Combobox(quick_controls, textvariable=self.print_quality, values=quality_names(), state="readonly", width=12)
-        self.top_quality_combo.pack(side="left", padx=(4, 0))
         ttk.Button(toolbar, text="Imprimir página", style="Accent.TButton", command=self.print_current).pack(side="right")
+
+        propertybar = ttk.Frame(main, padding=(8, 6), style="PropertyBar.TFrame")
+        propertybar.pack(fill="x", pady=(0, 10))
+        ttk.Label(propertybar, text="Perfil", style="Property.TLabel").pack(side="left")
+        self.profile_combo = ttk.Combobox(propertybar, textvariable=self.profile_name, values=profile_names(), state="readonly", width=10)
+        self.profile_combo.pack(side="left", padx=(4, 12))
+        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_combo_select)
+        ttk.Label(propertybar, text="Impressora", style="Property.TLabel").pack(side="left")
+        printer_values = self.detected_printers or [self.printer_name.get()]
+        self.top_printer_combo = ttk.Combobox(propertybar, textvariable=self.printer_name, values=printer_values, state="readonly", width=24)
+        self.top_printer_combo.pack(side="left", padx=(4, 12), fill="x", expand=True)
+        ttk.Label(propertybar, text="Tipo", style="Property.TLabel").pack(side="left")
+        self.top_output_combo = ttk.Combobox(propertybar, textvariable=self.output_mode, values=["Térmica TSPL", "Impressora normal"], state="readonly", width=18)
+        self.top_output_combo.pack(side="left", padx=(4, 12))
+        ttk.Label(propertybar, text="Qualidade", style="Property.TLabel").pack(side="left")
+        self.top_quality_combo = ttk.Combobox(propertybar, textvariable=self.print_quality, values=quality_names(), state="readonly", width=12)
+        self.top_quality_combo.pack(side="left", padx=(4, 0))
 
         content = ttk.PanedWindow(main, orient="horizontal")
         content.pack(fill="both", expand=True)
@@ -270,14 +273,38 @@ class ThermalLabelApp:
         self._refresh_profile_controls("10x15")
         self.profile_tree.bind("<<TreeviewSelect>>", self._on_profile_select)
 
-        summary = ttk.LabelFrame(profiles_tab, text="Perfil atual", padding=10)
-        summary.pack(fill="x", pady=(12, 0))
-        ttk.Label(summary, text="Tamanho físico").grid(row=0, column=0, sticky="w")
-        self.physical_size_label = ttk.Label(summary, text="100.0 x 150.0 mm", style="Value.TLabel")
-        self.physical_size_label.grid(row=0, column=1, sticky="e")
-        ttk.Label(summary, text="Bitmap").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(summary, textvariable=self.calculated_px, style="Value.TLabel").grid(row=1, column=1, sticky="e", pady=(6, 0))
-        summary.columnconfigure(1, weight=1)
+        measure_box = ttk.LabelFrame(profiles_tab, text="Medidas", padding=10)
+        measure_box.pack(fill="x", pady=(12, 0))
+        measure_row = 0
+
+        ttk.Label(measure_box, text="DPI real").grid(row=measure_row, column=0, sticky="w", pady=4)
+        ttk.Spinbox(measure_box, from_=150, to=600, increment=1, textvariable=self.dpi, width=10).grid(row=measure_row, column=1, sticky="w", pady=4)
+        measure_row += 1
+
+        ttk.Label(measure_box, text="Unidade").grid(row=measure_row, column=0, sticky="w", pady=4)
+        self.unit_cb = ttk.Combobox(measure_box, textvariable=self.size_unit, values=["px", "mm", "cm"], state="readonly")
+        self.unit_cb.grid(row=measure_row, column=1, sticky="ew", pady=4)
+        measure_row += 1
+
+        self.size1_label = ttk.Label(measure_box, text="Largura (mm)")
+        self.size1_label.grid(row=measure_row, column=0, sticky="w", pady=4)
+        self.size1_spin = ttk.Spinbox(measure_box, width=12, textvariable=self.size_width)
+        self.size1_spin.grid(row=measure_row, column=1, sticky="w", pady=4)
+        measure_row += 1
+
+        self.size2_label = ttk.Label(measure_box, text="Altura (mm)")
+        self.size2_label.grid(row=measure_row, column=0, sticky="w", pady=4)
+        self.size2_spin = ttk.Spinbox(measure_box, width=12, textvariable=self.size_height)
+        self.size2_spin.grid(row=measure_row, column=1, sticky="w", pady=4)
+        measure_row += 1
+
+        ttk.Label(measure_box, text="Margem (px)").grid(row=measure_row, column=0, sticky="w", pady=4)
+        ttk.Spinbox(measure_box, from_=0, to=250, increment=1, textvariable=self.margin_px, width=10).grid(row=measure_row, column=1, sticky="w", pady=4)
+        measure_row += 1
+
+        ttk.Label(measure_box, text="Bitmap").grid(row=measure_row, column=0, sticky="w", pady=4)
+        ttk.Label(measure_box, textvariable=self.calculated_px, style="Value.TLabel").grid(row=measure_row, column=1, sticky="w", pady=4)
+        measure_box.columnconfigure(1, weight=1)
 
         save_box = ttk.LabelFrame(profiles_tab, text="Salvar configurações", padding=10)
         save_box.pack(fill="x", pady=(12, 0))
@@ -291,42 +318,6 @@ class ThermalLabelApp:
         grid = ttk.Frame(setup_tab)
         grid.pack(fill="x")
         row = 0
-
-        ttk.Label(grid, text="Tipo").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Combobox(grid, textvariable=self.output_mode, values=["Térmica TSPL", "Impressora normal"], state="readonly").grid(row=row, column=1, sticky="ew", pady=4)
-        row += 1
-
-        ttk.Label(grid, text="DPI real").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Spinbox(grid, from_=150, to=600, increment=1, textvariable=self.dpi, width=10).grid(row=row, column=1, sticky="w", pady=4)
-        row += 1
-
-        ttk.Label(grid, text="Unidade").grid(row=row, column=0, sticky="w", pady=4)
-        self.unit_cb = ttk.Combobox(grid, textvariable=self.size_unit, values=["px", "mm", "cm"], state="readonly")
-        self.unit_cb.grid(row=row, column=1, sticky="ew", pady=4)
-        row += 1
-
-        self.size1_label = ttk.Label(grid, text="Largura (mm)")
-        self.size1_label.grid(row=row, column=0, sticky="w", pady=4)
-        self.size1_spin = ttk.Spinbox(grid, width=12, textvariable=self.size_width)
-        self.size1_spin.grid(row=row, column=1, sticky="w", pady=4)
-        row += 1
-
-        self.size2_label = ttk.Label(grid, text="Altura (mm)")
-        self.size2_label.grid(row=row, column=0, sticky="w", pady=4)
-        self.size2_spin = ttk.Spinbox(grid, width=12, textvariable=self.size_height)
-        self.size2_spin.grid(row=row, column=1, sticky="w", pady=4)
-        row += 1
-
-        ttk.Label(grid, text="Pixels gerados").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Label(grid, textvariable=self.calculated_px, style="Value.TLabel").grid(row=row, column=1, sticky="w", pady=4)
-        row += 1
-
-        ttk.Separator(grid).grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
-        row += 1
-
-        ttk.Label(grid, text="Margem (px)").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Spinbox(grid, from_=0, to=250, increment=1, textvariable=self.margin_px, width=10).grid(row=row, column=1, sticky="w", pady=4)
-        row += 1
 
         ttk.Label(grid, text="Offset X (px)").grid(row=row, column=0, sticky="w", pady=4)
         ttk.Spinbox(grid, from_=-500, to=500, increment=1, textvariable=self.offset_x_px, width=10).grid(row=row, column=1, sticky="w", pady=4)
@@ -396,15 +387,16 @@ class ThermalLabelApp:
         grid.columnconfigure(1, weight=1)
 
         ttk.Label(print_tab, text="Envio para impressora", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(print_tab, text="Use a página atual, todas as páginas ou uma faixa.", style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
-        ttk.Label(print_tab, text="Impressora").pack(anchor="w")
-        print_printer_values = self.detected_printers or [self.printer_name.get()]
-        self.print_printer_combo = ttk.Combobox(print_tab, textvariable=self.printer_name, values=print_printer_values, state="readonly")
-        self.print_printer_combo.pack(fill="x", pady=(4, 8))
-        ttk.Label(print_tab, text="Tipo").pack(anchor="w")
-        ttk.Combobox(print_tab, textvariable=self.output_mode, values=["Térmica TSPL", "Impressora normal"], state="readonly").pack(fill="x", pady=(4, 8))
-        ttk.Label(print_tab, text="Qualidade").pack(anchor="w")
-        ttk.Combobox(print_tab, textvariable=self.print_quality, values=quality_names(), state="readonly").pack(fill="x", pady=(4, 12))
+        ttk.Label(print_tab, text="Use os controles do topo para perfil, impressora, tipo e qualidade.", style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
+        print_summary = ttk.LabelFrame(print_tab, text="Configuração atual", padding=10)
+        print_summary.pack(fill="x", pady=(0, 12))
+        ttk.Label(print_summary, text="Impressora").grid(row=0, column=0, sticky="w")
+        ttk.Label(print_summary, textvariable=self.printer_name, style="Value.TLabel").grid(row=0, column=1, sticky="e")
+        ttk.Label(print_summary, text="Tipo").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(print_summary, textvariable=self.output_mode, style="Value.TLabel").grid(row=1, column=1, sticky="e", pady=(6, 0))
+        ttk.Label(print_summary, text="Qualidade").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(print_summary, textvariable=self.print_quality, style="Value.TLabel").grid(row=2, column=1, sticky="e", pady=(6, 0))
+        print_summary.columnconfigure(1, weight=1)
         ttk.Button(print_tab, text="Imprimir Página Atual", style="Accent.TButton", command=self.print_current).pack(fill="x")
         ttk.Button(print_tab, text="Imprimir Todas as Páginas", command=self.print_all).pack(fill="x", pady=8)
 
@@ -465,11 +457,13 @@ class ThermalLabelApp:
         style.configure(".", font=("DejaVu Sans", 10))
         style.configure("App.TFrame", background=bg)
         style.configure("Toolbar.TFrame", background=bg)
+        style.configure("PropertyBar.TFrame", background="#e8eaed", relief="flat")
         style.configure("Status.TFrame", background=bg)
         style.configure("PreviewShell.TFrame", background=preview_bg)
         style.configure("PreviewCanvas.TFrame", background=preview_bg, relief="flat", borderwidth=0)
         style.configure("Preview.TLabel", background=preview_bg, foreground="#dadce0")
         style.configure("TLabel", background=bg, foreground=text)
+        style.configure("Property.TLabel", background="#e8eaed", foreground=text)
         style.configure("Title.TLabel", background=bg, foreground=text, font=("DejaVu Sans", 11, "bold"))
         style.configure("Muted.TLabel", background=bg, foreground=muted)
         style.configure("Value.TLabel", background=bg, foreground=text, font=("DejaVu Sans", 10, "bold"))
@@ -671,8 +665,6 @@ class ThermalLabelApp:
         printer_values = self.detected_printers or [name]
         if hasattr(self, "top_printer_combo"):
             self.top_printer_combo.configure(values=printer_values)
-        if hasattr(self, "print_printer_combo"):
-            self.print_printer_combo.configure(values=printer_values)
         if hasattr(self, "driver_name_combo"):
             self.driver_name_combo.configure(values=printer_values)
         if ok:
@@ -1108,8 +1100,6 @@ class ThermalLabelApp:
     def _update_calculated_px(self) -> None:
         width, height = self._canvas_size_px()
         self.calculated_px.set(f"{width} x {height}")
-        if hasattr(self, "physical_size_label"):
-            self.physical_size_label.configure(text=f"{self.width_mm:.1f} x {self.height_mm:.1f} mm")
 
     def _canvas_size_px(self) -> tuple[int, int]:
         dpi = max(1, int(self.dpi.get()))
