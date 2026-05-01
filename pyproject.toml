@@ -1,0 +1,19 @@
+[project]
+name = "ynix-printer-modular"
+version = "1.2.0"
+description = "Ynix Printer Modular: preview, edição, fila e impressão modular para térmicas e CUPS."
+requires-python = ">=3.10"
+authors = [
+    { name = "CarlosTMJ" },
+]
+dependencies = [
+    "pillow>=10.0",
+    "tkinterdnd2>=0.4",
+]
+
+[project.scripts]
+ynix-printer-modular = "thermal_label_app.__main__:main"
+thermal-label-app = "thermal_label_app.__main__:main"
+
+[project.urls]
+Author = "https://github.com/carlostmj"
