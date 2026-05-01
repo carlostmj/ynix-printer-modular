@@ -18,7 +18,7 @@ from .imaging import RenderSettings, fit_image, fit_image_with_meta, open_mono
 from .installer import DEFAULT_TOMATE_NAME
 from .print_queue import PrintJob, PrintQueue
 from .printers import DEFAULT_CONTRACT, contract_by_display_name, contract_names, list_printers
-from .profiles import PROFILES, get_profile, profile_names
+from .profiles import LabelProfile, all_profiles, delete_custom_profile, get_profile, is_builtin_profile, profile_names, save_custom_profile
 from .quality import get_quality, quality_names
 from .tspl import build_tspl
 
@@ -121,6 +121,8 @@ class ThermalLabelApp:
         self.auto_rotate = tk.BooleanVar(value=True)
         self.fit_mode = tk.StringVar(value="contain")
         self.page_range = tk.StringVar(value="")
+        self.new_profile_name = tk.StringVar(value="")
+        self.profile_status = tk.StringVar(value="")
 
         self.files = [normalize_input_path(f) for f in files if normalize_input_path(f).is_file()]
         self.page_sources: list[Path] = []
@@ -190,7 +192,7 @@ class ThermalLabelApp:
         self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_combo_select)
         ttk.Label(quick_controls, text="Impressora").pack(side="left")
         printer_values = self.detected_printers or [self.printer_name.get()]
-        self.top_printer_combo = ttk.Combobox(quick_controls, textvariable=self.printer_name, values=printer_values, width=22)
+        self.top_printer_combo = ttk.Combobox(quick_controls, textvariable=self.printer_name, values=printer_values, state="readonly", width=22)
         self.top_printer_combo.pack(side="left", padx=(4, 10), fill="x", expand=True)
         ttk.Label(quick_controls, text="Qualidade").pack(side="left")
         self.top_quality_combo = ttk.Combobox(quick_controls, textvariable=self.print_quality, values=quality_names(), state="readonly", width=12)
@@ -260,15 +262,12 @@ class ThermalLabelApp:
         )
         self.profile_tree.heading("#0", text="Perfil")
         self.profile_tree.heading("size", text="Tamanho")
-        self.profile_tree.heading("dpi", text="DPI")
+        self.profile_tree.heading("dpi", text="DPI / Tipo")
         self.profile_tree.column("#0", width=70, stretch=False)
         self.profile_tree.column("size", width=160, stretch=True)
-        self.profile_tree.column("dpi", width=56, stretch=False, anchor="center")
+        self.profile_tree.column("dpi", width=96, stretch=False, anchor="center")
         self.profile_tree.pack(fill="x")
-        for profile in PROFILES:
-            self.profile_tree.insert("", "end", iid=profile.name, text=profile.name, values=(f"{profile.width_mm:g} x {profile.height_mm:g} mm", profile.dpi))
-        self.profile_tree.selection_set("10x15")
-        self.profile_tree.focus("10x15")
+        self._refresh_profile_controls("10x15")
         self.profile_tree.bind("<<TreeviewSelect>>", self._on_profile_select)
 
         summary = ttk.LabelFrame(profiles_tab, text="Perfil atual", padding=10)
@@ -279,6 +278,15 @@ class ThermalLabelApp:
         ttk.Label(summary, text="Bitmap").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Label(summary, textvariable=self.calculated_px, style="Value.TLabel").grid(row=1, column=1, sticky="e", pady=(6, 0))
         summary.columnconfigure(1, weight=1)
+
+        save_box = ttk.LabelFrame(profiles_tab, text="Salvar configurações", padding=10)
+        save_box.pack(fill="x", pady=(12, 0))
+        ttk.Label(save_box, text="Nome do perfil").grid(row=0, column=0, sticky="w")
+        ttk.Entry(save_box, textvariable=self.new_profile_name).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Button(save_box, text="Salvar perfil atual", command=self.save_current_profile).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(save_box, text="Excluir perfil salvo", command=self.delete_selected_profile).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(save_box, textvariable=self.profile_status, style="Muted.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        save_box.columnconfigure(1, weight=1)
 
         grid = ttk.Frame(setup_tab)
         grid.pack(fill="x")
@@ -391,7 +399,7 @@ class ThermalLabelApp:
         ttk.Label(print_tab, text="Use a página atual, todas as páginas ou uma faixa.", style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
         ttk.Label(print_tab, text="Impressora").pack(anchor="w")
         print_printer_values = self.detected_printers or [self.printer_name.get()]
-        self.print_printer_combo = ttk.Combobox(print_tab, textvariable=self.printer_name, values=print_printer_values)
+        self.print_printer_combo = ttk.Combobox(print_tab, textvariable=self.printer_name, values=print_printer_values, state="readonly")
         self.print_printer_combo.pack(fill="x", pady=(4, 8))
         ttk.Label(print_tab, text="Tipo").pack(anchor="w")
         ttk.Combobox(print_tab, textvariable=self.output_mode, values=["Térmica TSPL", "Impressora normal"], state="readonly").pack(fill="x", pady=(4, 8))
@@ -942,6 +950,61 @@ class ThermalLabelApp:
             self.profile_tree.see(profile.name)
         if refresh:
             self.schedule_preview()
+
+    def _refresh_profile_controls(self, selected: str | None = None) -> None:
+        profiles = all_profiles()
+        names = [profile.name for profile in profiles]
+        selected_name = selected or self.profile_name.get() or (names[0] if names else "")
+        if hasattr(self, "profile_combo"):
+            self.profile_combo.configure(values=names)
+        if hasattr(self, "profile_tree"):
+            for item in self.profile_tree.get_children():
+                self.profile_tree.delete(item)
+            for profile in profiles:
+                marker = "Padrão" if is_builtin_profile(profile.name) else "Salvo"
+                values = (f"{profile.width_mm:g} x {profile.height_mm:g} mm", f"{profile.dpi} | {marker}")
+                self.profile_tree.insert("", "end", iid=profile.name, text=profile.name, values=values)
+            if selected_name in names:
+                self.profile_tree.selection_set(selected_name)
+                self.profile_tree.focus(selected_name)
+                self.profile_tree.see(selected_name)
+
+    def save_current_profile(self) -> None:
+        name = self.new_profile_name.get().strip()
+        if not name:
+            self.profile_status.set("Digite um nome para o perfil.")
+            return
+        if is_builtin_profile(name):
+            self.profile_status.set("Use outro nome: perfis padrão não são sobrescritos.")
+            return
+        margin_mm = px_to_mm(max(0, int(self.margin_px.get())), max(1, int(self.dpi.get())))
+        profile = LabelProfile(name, float(self.width_mm), float(self.height_mm), int(self.dpi.get()), margin_mm)
+        try:
+            save_custom_profile(profile)
+        except OSError as exc:
+            messagebox.showerror("Perfis", f"Não foi possível salvar o perfil:\n{exc}")
+            return
+        self.profile_status.set(f"Perfil salvo: {name}")
+        self._refresh_profile_controls(name)
+        self.apply_profile(name)
+
+    def delete_selected_profile(self) -> None:
+        selection = self.profile_tree.selection()
+        name = selection[0] if selection else self.profile_name.get()
+        if not name:
+            self.profile_status.set("Selecione um perfil salvo para excluir.")
+            return
+        if is_builtin_profile(name):
+            self.profile_status.set("Perfis padrão não podem ser excluídos.")
+            return
+        if not messagebox.askyesno("Excluir perfil", f"Excluir o perfil salvo '{name}'?"):
+            return
+        if delete_custom_profile(name):
+            self.profile_status.set(f"Perfil excluído: {name}")
+            self._refresh_profile_controls("10x15")
+            self.apply_profile("10x15")
+        else:
+            self.profile_status.set("Perfil salvo não encontrado.")
 
     def _on_profile_select(self, _event=None) -> None:
         selection = self.profile_tree.selection()

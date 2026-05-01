@@ -25,6 +25,7 @@ Com arquivo inicial:
 ## Observações
 
 - O perfil `10x15` usa `100 x 150 mm` em `203 DPI`, que é o padrão mais comum em impressoras térmicas de etiqueta.
+- A aba `Perfis` permite salvar medidas personalizadas em `~/.config/ynix-printer-modular/profiles.json`.
 - Se sua impressora for realmente 300 DPI, selecione ou ajuste o campo DPI para `300`.
 - O preview atualiza sozinho quando tamanho, DPI, margem, offset, ajuste, rotação, inversão ou perfil mudam.
 - Ajustes de conteúdo como escala, offset, ajuste e rotação ficam salvos por página.
