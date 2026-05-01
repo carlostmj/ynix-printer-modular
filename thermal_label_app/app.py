@@ -13,6 +13,7 @@ from urllib.parse import unquote, urlparse
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
+from .edit_history import EditHistory
 from .geometry import mm_to_px, px_to_mm
 from .imaging import RenderSettings, fit_image, fit_image_with_meta, open_mono
 from .installer import DEFAULT_TOMATE_NAME
@@ -138,9 +139,7 @@ class ThermalLabelApp:
         self.loading_page_settings = False
         self.page_adjustments: dict[int, dict[str, object]] = {}
         self.default_page_adjustment: dict[str, object] | None = None
-        self.undo_stack: list[dict[str, object]] = []
-        self.redo_stack: list[dict[str, object]] = []
-        self.last_history_snapshot: dict[str, object] | None = None
+        self.edit_history = EditHistory()
         self.history_paused = False
         self.drag_start = None
         self.resize_start = None
@@ -882,10 +881,12 @@ class ThermalLabelApp:
         self.selected_overlay_id = None
         handle = self._preview_handle_at(event.x, event.y)
         if self.edit_mode.get() == "Rotacionar":
+            self._begin_interactive_adjustment()
             self.rotate_start = (event.x, event.y, int(self.rotation_degrees.get()))
             self.preview_canvas.configure(cursor="exchange")
             return
         if handle:
+            self._begin_interactive_adjustment()
             self.resize_start = (
                 handle,
                 event.x,
@@ -897,6 +898,7 @@ class ThermalLabelApp:
             self.preview_canvas.configure(cursor="sizing")
             return
         if self._point_in_preview_box(event.x, event.y):
+            self._begin_interactive_adjustment()
             self.drag_start = (event.x, event.y, int(self.offset_x_px.get()), int(self.offset_y_px.get()))
             self.preview_canvas.configure(cursor="fleur")
 
@@ -909,6 +911,7 @@ class ThermalLabelApp:
             a0 = math.degrees(math.atan2(start_y - cy, start_x - cx))
             a1 = math.degrees(math.atan2(event.y - cy, event.x - cx))
             self.rotation_degrees.set(round(start_angle + a1 - a0))
+            self._preview_interactive_adjustment()
             return
         if self.resize_start:
             handle, start_x, start_y, scale_x, scale_y, scale_uniform = self.resize_start
@@ -922,12 +925,14 @@ class ThermalLabelApp:
             else:
                 self.scale_x_percent.set(max(10, min(300, scale_x + round(dx * direction_x / 2))))
                 self.scale_y_percent.set(max(10, min(300, scale_y + round(dy * direction_y / 2))))
+            self._preview_interactive_adjustment()
             return
         if self.drag_start:
             start_x, start_y, offset_x, offset_y = self.drag_start
             scale = max(self.preview_scale, 0.01)
             self.offset_x_px.set(round(offset_x + (event.x - start_x) / scale))
             self.offset_y_px.set(round(offset_y + (event.y - start_y) / scale))
+            self._preview_interactive_adjustment()
             return
         if self.overlay_drag_start and self.selected_overlay_id:
             start_x, start_y, overlay_x, overlay_y, scale = self.overlay_drag_start
@@ -939,10 +944,13 @@ class ThermalLabelApp:
                     return
 
     def _end_preview_action(self, _event=None) -> None:
+        had_interactive_adjustment = bool(self.drag_start or self.resize_start or self.rotate_start)
         self.drag_start = None
         self.resize_start = None
         self.rotate_start = None
         self.overlay_drag_start = None
+        if had_interactive_adjustment:
+            self._commit_interactive_adjustment()
         self.preview_canvas.configure(cursor="")
 
     def _preview_center(self) -> tuple[float, float]:
@@ -1027,59 +1035,57 @@ class ThermalLabelApp:
             self.history_paused = False
 
     def _reset_edit_history(self) -> None:
-        self.undo_stack = []
-        self.redo_stack = []
-        self.last_history_snapshot = self._current_page_adjustment()
+        self.edit_history.reset(self._current_page_adjustment())
         self._update_history_buttons()
 
     def _record_edit_history(self) -> None:
         if self.history_paused:
             return
-        snapshot = self._current_page_adjustment()
-        if self.last_history_snapshot is None:
-            self.last_history_snapshot = snapshot
-            self._update_history_buttons()
-            return
-        if snapshot == self.last_history_snapshot:
-            return
-        self.undo_stack.append(dict(self.last_history_snapshot))
-        if len(self.undo_stack) > 100:
-            self.undo_stack.pop(0)
-        self.redo_stack.clear()
-        self.last_history_snapshot = snapshot
+        self.edit_history.record(self._current_page_adjustment())
         self._update_history_buttons()
 
     def _update_history_buttons(self) -> None:
         if hasattr(self, "undo_button"):
-            self.undo_button.configure(state="normal" if self.undo_stack else "disabled")
+            self.undo_button.configure(state="normal" if self.edit_history.can_undo else "disabled")
         if hasattr(self, "redo_button"):
-            self.redo_button.configure(state="normal" if self.redo_stack else "disabled")
+            self.redo_button.configure(state="normal" if self.edit_history.can_redo else "disabled")
+
+    def _begin_interactive_adjustment(self) -> None:
+        self.edit_history.begin_batch(self._current_page_adjustment())
+        self.history_paused = True
+
+    def _preview_interactive_adjustment(self) -> None:
+        self._save_current_page_adjustment()
+        self._update_calculated_px()
+        self.schedule_preview()
+
+    def _commit_interactive_adjustment(self) -> None:
+        self.history_paused = False
+        self.edit_history.commit_batch(self._current_page_adjustment())
+        self._save_current_page_adjustment()
+        self._update_history_buttons()
+        self._update_calculated_px()
+        self.schedule_preview()
 
     def undo_edit(self) -> None:
-        if not self.undo_stack:
+        previous = self.edit_history.undo(self._current_page_adjustment())
+        if previous is None:
             self.status_message.set("Nada para desfazer")
             return
-        current = self._current_page_adjustment()
-        previous = self.undo_stack.pop()
-        self.redo_stack.append(current)
         self._set_page_adjustment(previous)
         self._save_current_page_adjustment()
-        self.last_history_snapshot = self._current_page_adjustment()
         self._update_history_buttons()
         self._update_calculated_px()
         self.schedule_preview()
         self.status_message.set("Ajuste desfeito")
 
     def redo_edit(self) -> None:
-        if not self.redo_stack:
+        next_adjustment = self.edit_history.redo(self._current_page_adjustment())
+        if next_adjustment is None:
             self.status_message.set("Nada para refazer")
             return
-        current = self._current_page_adjustment()
-        next_adjustment = self.redo_stack.pop()
-        self.undo_stack.append(current)
         self._set_page_adjustment(next_adjustment)
         self._save_current_page_adjustment()
-        self.last_history_snapshot = self._current_page_adjustment()
         self._update_history_buttons()
         self._update_calculated_px()
         self.schedule_preview()
