@@ -7,11 +7,11 @@ import tempfile
 import math
 from io import BytesIO
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 import tkinter as tk
 from urllib.parse import unquote, urlparse
 
-from PIL import Image, ImageOps, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
 from .geometry import mm_to_px, px_to_mm
 from .imaging import RenderSettings, fit_image, fit_image_with_meta, open_mono
@@ -145,7 +145,11 @@ class ThermalLabelApp:
         self.drag_start = None
         self.resize_start = None
         self.rotate_start = None
+        self.overlay_drag_start = None
         self.edit_mode = tk.StringVar(value="Redimensionar")
+        self.page_overlays: dict[int, list[dict[str, object]]] = {}
+        self.selected_overlay_id: str | None = None
+        self.next_overlay_id = 1
         self.detected_printers = list_printers()
         if self.detected_printers:
             self.printer_name.set(self.detected_printers[0])
@@ -186,6 +190,10 @@ class ThermalLabelApp:
         self.undo_button.pack(side="left")
         self.redo_button = ttk.Button(toolbar, text="Refazer", command=self.redo_edit)
         self.redo_button.pack(side="left", padx=(6, 10))
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=(0, 10))
+        ttk.Button(toolbar, text="Texto", command=self.add_text_overlay).pack(side="left")
+        ttk.Button(toolbar, text="Imagem", command=self.add_image_overlay).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Remover camada", command=self.delete_selected_overlay).pack(side="left", padx=(6, 10))
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=(0, 10))
         ttk.Button(toolbar, text="Anterior", command=self.prev_page).pack(side="left")
         ttk.Button(toolbar, text="Próxima", command=self.next_page).pack(side="left", padx=(6, 0))
@@ -525,6 +533,12 @@ class ThermalLabelApp:
         view_menu.add_command(label="Limpar corte", accelerator="Ctrl+Shift+0", command=self.reset_crop)
         menubar.add_cascade(label="Navegação", menu=view_menu)
 
+        layers_menu = tk.Menu(menubar, tearoff=False)
+        layers_menu.add_command(label="Adicionar texto", command=self.add_text_overlay)
+        layers_menu.add_command(label="Adicionar imagem", command=self.add_image_overlay)
+        layers_menu.add_command(label="Remover camada selecionada", accelerator="Delete", command=self.delete_selected_overlay)
+        menubar.add_cascade(label="Camadas", menu=layers_menu)
+
         tools_menu = tk.Menu(menubar, tearoff=False)
         tools_menu.add_command(label="Driver Tomate / CUPS...", command=self.open_driver_window)
         tools_menu.add_command(label="Verificar driver agora", command=lambda: self.open_driver_window(refresh=True))
@@ -543,6 +557,7 @@ class ThermalLabelApp:
         self.root.bind_all("<Control-Z>", lambda _event: self.redo_edit())
         self.root.bind_all("<Control-0>", lambda _event: self.reset_scale())
         self.root.bind_all("<Control-parenright>", lambda _event: self.reset_crop())
+        self.root.bind_all("<Delete>", lambda _event: self.delete_selected_overlay())
         self.root.bind_all("<Escape>", lambda _event: self._end_preview_action())
 
     def _queue_job_changed(self, job: PrintJob) -> None:
@@ -723,6 +738,111 @@ class ThermalLabelApp:
             self.status_message.set("Solte arquivos PDF ou imagem.")
         return "copy"
 
+    def _new_overlay_id(self) -> str:
+        overlay_id = f"layer-{self.next_overlay_id}"
+        self.next_overlay_id += 1
+        return overlay_id
+
+    def _current_overlays(self) -> list[dict[str, object]]:
+        return self.page_overlays.setdefault(self.current_index, [])
+
+    def add_text_overlay(self) -> None:
+        if not self.page_sources:
+            messagebox.showinfo("Camadas", "Abra um arquivo antes de adicionar texto.")
+            return
+        text = simpledialog.askstring("Adicionar texto", "Texto:", parent=self.root)
+        if not text:
+            return
+        width, height = self._canvas_size_px()
+        overlay = {
+            "id": self._new_overlay_id(),
+            "type": "text",
+            "text": text,
+            "x": round(width * 0.1),
+            "y": round(height * 0.1),
+            "w": max(120, round(width * 0.35)),
+            "h": 44,
+            "font_size": max(18, round(height * 0.035)),
+        }
+        self._current_overlays().append(overlay)
+        self.selected_overlay_id = str(overlay["id"])
+        self.status_message.set("Texto adicionado como camada.")
+        self.schedule_preview()
+
+    def add_image_overlay(self) -> None:
+        if not self.page_sources:
+            messagebox.showinfo("Camadas", "Abra um arquivo antes de adicionar imagem.")
+            return
+        path = filedialog.askopenfilename(
+            title="Adicionar imagem",
+            filetypes=[
+                ("Imagens", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"),
+                ("Todos", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        source = normalize_input_path(path)
+        if not source.is_file():
+            return
+        width, height = self._canvas_size_px()
+        try:
+            with Image.open(source) as img:
+                ratio = min(width * 0.35 / img.width, height * 0.35 / img.height, 1.0)
+                overlay_w = max(1, round(img.width * ratio))
+                overlay_h = max(1, round(img.height * ratio))
+        except Exception as exc:
+            messagebox.showerror("Camadas", f"Não foi possível abrir a imagem:\n{exc}")
+            return
+        overlay = {
+            "id": self._new_overlay_id(),
+            "type": "image",
+            "path": str(source),
+            "x": round(width * 0.1),
+            "y": round(height * 0.1),
+            "w": overlay_w,
+            "h": overlay_h,
+        }
+        self._current_overlays().append(overlay)
+        self.selected_overlay_id = str(overlay["id"])
+        self.status_message.set("Imagem adicionada como camada.")
+        self.schedule_preview()
+
+    def delete_selected_overlay(self) -> None:
+        if not self.selected_overlay_id:
+            return
+        overlays = self._current_overlays()
+        remaining = [overlay for overlay in overlays if overlay.get("id") != self.selected_overlay_id]
+        if len(remaining) == len(overlays):
+            return
+        self.page_overlays[self.current_index] = remaining
+        self.selected_overlay_id = None
+        self.overlay_drag_start = None
+        self.status_message.set("Camada removida.")
+        self.schedule_preview()
+
+    def _overlay_canvas_box(self, overlay: dict[str, object]) -> tuple[float, float, float, float] | None:
+        if not self.preview_image_box:
+            return None
+        x1, y1, _x2, _y2 = self.preview_image_box
+        border = 2
+        scale = self.preview_scale
+        ox = float(overlay.get("x", 0))
+        oy = float(overlay.get("y", 0))
+        ow = float(overlay.get("w", 1))
+        oh = float(overlay.get("h", 1))
+        return (x1 + border + ox * scale, y1 + border + oy * scale, x1 + border + (ox + ow) * scale, y1 + border + (oy + oh) * scale)
+
+    def _overlay_at(self, x: int, y: int) -> dict[str, object] | None:
+        for overlay in reversed(self._current_overlays()):
+            box = self._overlay_canvas_box(overlay)
+            if not box:
+                continue
+            x1, y1, x2, y2 = box
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return overlay
+        return None
+
     def _toggle_preview_mode(self, _event=None) -> None:
         self.edit_mode.set("Rotacionar" if self.edit_mode.get() == "Redimensionar" else "Redimensionar")
         self._draw_selection_overlay()
@@ -751,6 +871,15 @@ class ThermalLabelApp:
     def _start_preview_action(self, event) -> None:
         if not self.page_sources:
             return
+        overlay = self._overlay_at(event.x, event.y)
+        if overlay:
+            self.selected_overlay_id = str(overlay["id"])
+            scale = max(self.preview_scale, 0.01)
+            self.overlay_drag_start = (event.x, event.y, float(overlay.get("x", 0)), float(overlay.get("y", 0)), scale)
+            self.preview_canvas.configure(cursor="fleur")
+            self._draw_selection_overlay()
+            return
+        self.selected_overlay_id = None
         handle = self._preview_handle_at(event.x, event.y)
         if self.edit_mode.get() == "Rotacionar":
             self.rotate_start = (event.x, event.y, int(self.rotation_degrees.get()))
@@ -799,11 +928,21 @@ class ThermalLabelApp:
             scale = max(self.preview_scale, 0.01)
             self.offset_x_px.set(round(offset_x + (event.x - start_x) / scale))
             self.offset_y_px.set(round(offset_y + (event.y - start_y) / scale))
+            return
+        if self.overlay_drag_start and self.selected_overlay_id:
+            start_x, start_y, overlay_x, overlay_y, scale = self.overlay_drag_start
+            for overlay in self._current_overlays():
+                if overlay.get("id") == self.selected_overlay_id:
+                    overlay["x"] = round(overlay_x + (event.x - start_x) / scale)
+                    overlay["y"] = round(overlay_y + (event.y - start_y) / scale)
+                    self.schedule_preview()
+                    return
 
     def _end_preview_action(self, _event=None) -> None:
         self.drag_start = None
         self.resize_start = None
         self.rotate_start = None
+        self.overlay_drag_start = None
         self.preview_canvas.configure(cursor="")
 
     def _preview_center(self) -> tuple[float, float]:
@@ -815,7 +954,9 @@ class ThermalLabelApp:
     def _update_preview_cursor(self, event) -> None:
         if not self.page_sources:
             return
-        if self.edit_mode.get() == "Rotacionar" and self._point_in_preview_box(event.x, event.y):
+        if self._overlay_at(event.x, event.y):
+            self.preview_canvas.configure(cursor="fleur")
+        elif self.edit_mode.get() == "Rotacionar" and self._point_in_preview_box(event.x, event.y):
             self.preview_canvas.configure(cursor="exchange")
         elif self._preview_handle_at(event.x, event.y):
             self.preview_canvas.configure(cursor="sizing")
@@ -1290,6 +1431,9 @@ class ThermalLabelApp:
         self.page_sources = []
         self.current_index = 0
         self.page_adjustments = {}
+        self.page_overlays = {}
+        self.selected_overlay_id = None
+        self.overlay_drag_start = None
         files = [normalize_input_path(file) for file in files]
         skipped = [file for file in files if file.suffix.lower() not in SUPPORTED_SUFFIXES]
         files = [file for file in files if file.is_file() and file.suffix.lower() in SUPPORTED_SUFFIXES]
@@ -1319,6 +1463,7 @@ class ThermalLabelApp:
             return
         self._save_current_page_adjustment()
         self.current_index = max(0, self.current_index - 1)
+        self.selected_overlay_id = None
         self._load_page_adjustment()
         self.refresh_preview()
 
@@ -1327,6 +1472,7 @@ class ThermalLabelApp:
             return
         self._save_current_page_adjustment()
         self.current_index = min(len(self.page_sources) - 1, self.current_index + 1)
+        self.selected_overlay_id = None
         self._load_page_adjustment()
         self.refresh_preview()
 
@@ -1334,11 +1480,46 @@ class ThermalLabelApp:
         if not self.page_sources:
             return None
         src = open_mono(self.page_sources[self.current_index])
-        return fit_image(src, self.current_render_settings())
+        return self._apply_overlays(fit_image(src, self.current_render_settings()), self.current_index)
 
     def _fitted_for_index(self, index: int):
         src = open_mono(self.page_sources[index])
         return fit_image(src, self.render_settings_for_index(index))
+
+    def _font_for_size(self, size: int) -> ImageFont.ImageFont:
+        for font_path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+            try:
+                return ImageFont.truetype(font_path, size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    def _apply_overlays(self, img: Image.Image, index: int) -> Image.Image:
+        canvas = img.convert("L")
+        for overlay in self.page_overlays.get(index, []):
+            x = round(float(overlay.get("x", 0)))
+            y = round(float(overlay.get("y", 0)))
+            w = max(1, round(float(overlay.get("w", 1))))
+            h = max(1, round(float(overlay.get("h", 1))))
+            if overlay.get("type") == "text":
+                draw = ImageDraw.Draw(canvas)
+                font_size = max(6, int(overlay.get("font_size", 24)))
+                font = self._font_for_size(font_size)
+                draw.multiline_text((x, y), str(overlay.get("text", "")), fill=0, font=font, spacing=4)
+            elif overlay.get("type") == "image":
+                path = Path(str(overlay.get("path", "")))
+                if not path.is_file():
+                    continue
+                try:
+                    layer = ImageOps.exif_transpose(Image.open(path)).convert("L")
+                except Exception:
+                    continue
+                layer = layer.resize((w, h), Image.Resampling.LANCZOS).convert("1").convert("L")
+                canvas.paste(layer, (x, y))
+        return canvas.convert("1")
+
+    def _composed_for_index(self, index: int) -> Image.Image:
+        return self._apply_overlays(self._fitted_for_index(index), index)
 
     def schedule_preview(self) -> None:
         if self.preview_job is not None:
@@ -1357,7 +1538,7 @@ class ThermalLabelApp:
 
         src = open_mono(self.page_sources[self.current_index])
         result = fit_image_with_meta(src, self.current_render_settings())
-        img = result.image
+        img = self._apply_overlays(result.image, self.current_index)
         self.preview_image = img
 
         available_w = max(240, self.preview_canvas.winfo_width() - 20)
@@ -1432,9 +1613,20 @@ class ThermalLabelApp:
                 anchor="w",
                 tags=("selection",),
             )
+        for overlay in self._current_overlays():
+            box = self._overlay_canvas_box(overlay)
+            if not box:
+                continue
+            ox1, oy1, ox2, oy2 = box
+            selected = overlay.get("id") == self.selected_overlay_id
+            outline = "#34a853" if selected else "#9aa0a6"
+            dash = () if selected else (4, 3)
+            self.preview_canvas.create_rectangle(ox1, oy1, ox2, oy2, outline=outline, width=2 if selected else 1, dash=dash, tags=("selection",))
+            if selected:
+                self.preview_canvas.create_text(ox1, max(12, oy1 - 14), text="Camada", fill=outline, anchor="w", tags=("selection",))
 
     def _payload_for_index(self, index: int) -> bytes:
-        img = self._fitted_for_index(index)
+        img = self._composed_for_index(index)
         quality = get_quality(self.print_quality.get())
         return build_tspl(
             img,
@@ -1446,7 +1638,7 @@ class ThermalLabelApp:
         )
 
     def _normal_document_for_index(self, index: int) -> bytes:
-        img = self._fitted_for_index(index).convert("L")
+        img = self._composed_for_index(index).convert("L")
         out = BytesIO()
         img.save(out, format="PNG")
         return out.getvalue()
