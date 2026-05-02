@@ -8,6 +8,7 @@ authors = [
 ]
 dependencies = [
     "pillow>=10.0",
+    "qrcode[pil]>=7.4",
     "tkinterdnd2>=0.4",
 ]
 
