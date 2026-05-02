@@ -29,6 +29,7 @@ Com arquivo inicial:
 - A aba `Perfis` abre uma janela para criar medidas personalizadas salvas em `~/.config/ynix-printer-modular/profiles.json`.
 - A aba `Ajustes` fica dedicada ao posicionamento, escala, rotação, corte e opções do conteúdo.
 - O menu `Camadas` e os botões do topo permitem adicionar texto/imagem por cima da página atual e mover a camada no preview.
+- A camada `Numeração` gera comandas sequenciais, por exemplo de `1` a `1500`, e a aba `Impressão` envia a sequência inteira.
 - Se sua impressora for realmente 300 DPI, selecione ou ajuste o campo DPI para `300`.
 - O preview atualiza sozinho quando tamanho, DPI, margem, offset, ajuste, rotação, inversão ou perfil mudam.
 - Ajustes de conteúdo como escala, offset, ajuste e rotação ficam salvos por página.

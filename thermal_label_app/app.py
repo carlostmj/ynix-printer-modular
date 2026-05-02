@@ -192,6 +192,7 @@ class ThermalLabelApp:
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=(0, 10))
         ttk.Button(toolbar, text="Texto", command=self.add_text_overlay).pack(side="left")
         ttk.Button(toolbar, text="Imagem", command=self.add_image_overlay).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Numerar", command=self.open_counter_window).pack(side="left", padx=(6, 0))
         ttk.Button(toolbar, text="Remover camada", command=self.delete_selected_overlay).pack(side="left", padx=(6, 10))
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=(0, 10))
         ttk.Button(toolbar, text="Anterior", command=self.prev_page).pack(side="left")
@@ -411,6 +412,7 @@ class ThermalLabelApp:
         print_summary.columnconfigure(1, weight=1)
         ttk.Button(print_tab, text="Imprimir Página Atual", style="Accent.TButton", command=self.print_current).pack(fill="x")
         ttk.Button(print_tab, text="Imprimir Todas as Páginas", command=self.print_all).pack(fill="x", pady=8)
+        ttk.Button(print_tab, text="Imprimir Numeração", command=self.print_counter_sequence).pack(fill="x")
 
         range_box = ttk.LabelFrame(print_tab, text="Faixa de páginas", padding=10)
         range_box.pack(fill="x", pady=(8, 0))
@@ -535,6 +537,7 @@ class ThermalLabelApp:
         layers_menu = tk.Menu(menubar, tearoff=False)
         layers_menu.add_command(label="Adicionar texto", command=self.add_text_overlay)
         layers_menu.add_command(label="Adicionar imagem", command=self.add_image_overlay)
+        layers_menu.add_command(label="Adicionar numeração", command=self.open_counter_window)
         layers_menu.add_command(label="Remover camada selecionada", accelerator="Delete", command=self.delete_selected_overlay)
         menubar.add_cascade(label="Camadas", menu=layers_menu)
 
@@ -805,6 +808,107 @@ class ThermalLabelApp:
         self._current_overlays().append(overlay)
         self.selected_overlay_id = str(overlay["id"])
         self.status_message.set("Imagem adicionada como camada.")
+        self.schedule_preview()
+
+    def open_counter_window(self) -> None:
+        if not self.page_sources:
+            messagebox.showinfo("Camadas", "Abra um arquivo antes de adicionar numeração.")
+            return
+        if hasattr(self, "counter_window") and self.counter_window.winfo_exists():
+            self.counter_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Numeração")
+        window.geometry("420x330")
+        window.minsize(420, 330)
+        window.transient(self.root)
+        window.grab_set()
+        window.configure(bg="#f1f3f4")
+        self.counter_window = window
+
+        start_var = tk.IntVar(value=1)
+        end_var = tk.IntVar(value=1500)
+        digits_var = tk.IntVar(value=0)
+        prefix_var = tk.StringVar(value="")
+        suffix_var = tk.StringVar(value="")
+        status_var = tk.StringVar(value="A camada será criada na página atual.")
+
+        container = ttk.Frame(window, padding=12, style="App.TFrame")
+        container.pack(fill="both", expand=True)
+        ttk.Label(container, text="Numeração", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(container, text="Crie comandas/etiquetas sequenciais.", style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
+
+        form = ttk.Frame(container, style="App.TFrame")
+        form.pack(fill="x")
+        ttk.Label(form, text="Início").grid(row=0, column=0, sticky="w", pady=5, padx=(0, 10))
+        ttk.Spinbox(form, from_=0, to=999999, increment=1, textvariable=start_var, width=14).grid(row=0, column=1, sticky="w", pady=5)
+        ttk.Label(form, text="Fim").grid(row=1, column=0, sticky="w", pady=5, padx=(0, 10))
+        ttk.Spinbox(form, from_=0, to=999999, increment=1, textvariable=end_var, width=14).grid(row=1, column=1, sticky="w", pady=5)
+        ttk.Label(form, text="Zeros").grid(row=2, column=0, sticky="w", pady=5, padx=(0, 10))
+        ttk.Spinbox(form, from_=0, to=12, increment=1, textvariable=digits_var, width=14).grid(row=2, column=1, sticky="w", pady=5)
+        ttk.Label(form, text="Prefixo").grid(row=3, column=0, sticky="w", pady=5, padx=(0, 10))
+        ttk.Entry(form, textvariable=prefix_var).grid(row=3, column=1, sticky="ew", pady=5)
+        ttk.Label(form, text="Sufixo").grid(row=4, column=0, sticky="w", pady=5, padx=(0, 10))
+        ttk.Entry(form, textvariable=suffix_var).grid(row=4, column=1, sticky="ew", pady=5)
+        form.columnconfigure(1, weight=1)
+
+        ttk.Label(container, textvariable=status_var, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
+        actions = ttk.Frame(container, style="App.TFrame")
+        actions.pack(fill="x", side="bottom", pady=(14, 0))
+        ttk.Button(actions, text="Cancelar", width=14, command=window.destroy).pack(side="right")
+        ttk.Button(
+            actions,
+            text="Criar",
+            width=14,
+            style="Accent.TButton",
+            command=lambda: self.add_counter_overlay_from_window(window, start_var, end_var, digits_var, prefix_var, suffix_var, status_var),
+        ).pack(side="right", padx=(0, 8))
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.bind("<Return>", lambda _event: self.add_counter_overlay_from_window(window, start_var, end_var, digits_var, prefix_var, suffix_var, status_var))
+
+    def add_counter_overlay_from_window(
+        self,
+        window: tk.Toplevel,
+        start_var: tk.IntVar,
+        end_var: tk.IntVar,
+        digits_var: tk.IntVar,
+        prefix_var: tk.StringVar,
+        suffix_var: tk.StringVar,
+        status_var: tk.StringVar,
+    ) -> None:
+        try:
+            start = int(start_var.get())
+            end = int(end_var.get())
+            digits = max(0, int(digits_var.get()))
+        except (tk.TclError, ValueError):
+            status_var.set("Revise início, fim e zeros.")
+            return
+        if end < start:
+            status_var.set("O fim precisa ser maior ou igual ao início.")
+            return
+        if end - start + 1 > 10000:
+            status_var.set("Limite inicial: até 10.000 folhas por sequência.")
+            return
+        width, height = self._canvas_size_px()
+        overlay = {
+            "id": self._new_overlay_id(),
+            "type": "counter",
+            "start": start,
+            "end": end,
+            "digits": digits,
+            "prefix": prefix_var.get(),
+            "suffix": suffix_var.get(),
+            "x": round(width * 0.1),
+            "y": round(height * 0.1),
+            "w": max(120, round(width * 0.3)),
+            "h": 48,
+            "font_size": max(20, round(height * 0.04)),
+        }
+        self._current_overlays().append(overlay)
+        self.selected_overlay_id = str(overlay["id"])
+        self.status_message.set(f"Numeração criada: {start} até {end}.")
+        window.destroy()
         self.schedule_preview()
 
     def delete_selected_overlay(self) -> None:
@@ -1500,18 +1604,31 @@ class ThermalLabelApp:
                 continue
         return ImageFont.load_default()
 
-    def _apply_overlays(self, img: Image.Image, index: int) -> Image.Image:
+    def _format_counter_overlay(self, overlay: dict[str, object], value: int | None = None) -> str:
+        number = int(overlay.get("start", 1) if value is None else value)
+        digits = max(0, int(overlay.get("digits", 0)))
+        body = str(number).zfill(digits) if digits else str(number)
+        return f"{overlay.get('prefix', '')}{body}{overlay.get('suffix', '')}"
+
+    def _counter_overlay_for_index(self, index: int) -> dict[str, object] | None:
+        for overlay in self.page_overlays.get(index, []):
+            if overlay.get("type") == "counter":
+                return overlay
+        return None
+
+    def _apply_overlays(self, img: Image.Image, index: int, counter_value: int | None = None) -> Image.Image:
         canvas = img.convert("L")
         for overlay in self.page_overlays.get(index, []):
             x = round(float(overlay.get("x", 0)))
             y = round(float(overlay.get("y", 0)))
             w = max(1, round(float(overlay.get("w", 1))))
             h = max(1, round(float(overlay.get("h", 1))))
-            if overlay.get("type") == "text":
+            if overlay.get("type") in {"text", "counter"}:
                 draw = ImageDraw.Draw(canvas)
                 font_size = max(6, int(overlay.get("font_size", 24)))
                 font = self._font_for_size(font_size)
-                draw.multiline_text((x, y), str(overlay.get("text", "")), fill=0, font=font, spacing=4)
+                text = self._format_counter_overlay(overlay, counter_value) if overlay.get("type") == "counter" else str(overlay.get("text", ""))
+                draw.multiline_text((x, y), text, fill=0, font=font, spacing=4)
             elif overlay.get("type") == "image":
                 path = Path(str(overlay.get("path", "")))
                 if not path.is_file():
@@ -1524,8 +1641,8 @@ class ThermalLabelApp:
                 canvas.paste(layer, (x, y))
         return canvas.convert("1")
 
-    def _composed_for_index(self, index: int) -> Image.Image:
-        return self._apply_overlays(self._fitted_for_index(index), index)
+    def _composed_for_index(self, index: int, counter_value: int | None = None) -> Image.Image:
+        return self._apply_overlays(self._fitted_for_index(index), index, counter_value)
 
     def schedule_preview(self) -> None:
         if self.preview_job is not None:
@@ -1631,8 +1748,8 @@ class ThermalLabelApp:
             if selected:
                 self.preview_canvas.create_text(ox1, max(12, oy1 - 14), text="Camada", fill=outline, anchor="w", tags=("selection",))
 
-    def _payload_for_index(self, index: int) -> bytes:
-        img = self._composed_for_index(index)
+    def _payload_for_index(self, index: int, counter_value: int | None = None) -> bytes:
+        img = self._composed_for_index(index, counter_value)
         quality = get_quality(self.print_quality.get())
         return build_tspl(
             img,
@@ -1643,8 +1760,8 @@ class ThermalLabelApp:
             density=quality.density,
         )
 
-    def _normal_document_for_index(self, index: int) -> bytes:
-        img = self._composed_for_index(index).convert("L")
+    def _normal_document_for_index(self, index: int, counter_value: int | None = None) -> bytes:
+        img = self._composed_for_index(index, counter_value).convert("L")
         out = BytesIO()
         img.save(out, format="PNG")
         return out.getvalue()
@@ -1669,6 +1786,39 @@ class ThermalLabelApp:
             self._select_queue_job_when_ready(job.id)
             self.status_message.set(f"Trabalho #{job.id} adicionado na fila.")
             self.refresh_preview()
+        except Exception as exc:
+            messagebox.showerror("Erro", str(exc))
+
+    def print_counter_sequence(self) -> None:
+        if not self.page_sources:
+            return
+        counter = self._counter_overlay_for_index(self.current_index)
+        if not counter:
+            messagebox.showinfo("Numeração", "Adicione uma camada de numeração na página atual.")
+            return
+        start = int(counter.get("start", 1))
+        end = int(counter.get("end", start))
+        values = list(range(start, end + 1))
+        if not values:
+            return
+        if len(values) > 2000 and not messagebox.askyesno("Numeração", f"Gerar {len(values)} folhas para a fila?"):
+            return
+        try:
+            normal_mode = self.output_mode.get() == "Impressora normal"
+            payloads = [
+                self._normal_document_for_index(self.current_index, value) if normal_mode else self._payload_for_index(self.current_index, value)
+                for value in values
+            ]
+            job = self.print_queue.add(
+                f"Numeração {start}-{end}",
+                self.printer_name.get(),
+                self.print_quality.get(),
+                payloads,
+                output_mode="normal" if normal_mode else "tspl",
+            )
+            self._show_sidebar_tab("Fila")
+            self._select_queue_job_when_ready(job.id)
+            self.status_message.set(f"Numeração #{job.id}: {len(values)} folha(s) adicionadas.")
         except Exception as exc:
             messagebox.showerror("Erro", str(exc))
 
