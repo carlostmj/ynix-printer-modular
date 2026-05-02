@@ -7,7 +7,7 @@ import tempfile
 import math
 from io import BytesIO
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from urllib.parse import unquote, urlparse
 
@@ -193,6 +193,7 @@ class ThermalLabelApp:
         ttk.Button(toolbar, text="Texto", command=self.add_text_overlay).pack(side="left")
         ttk.Button(toolbar, text="Imagem", command=self.add_image_overlay).pack(side="left", padx=(6, 0))
         ttk.Button(toolbar, text="Numerar", command=self.open_counter_window).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Editar camada", command=self.edit_selected_overlay).pack(side="left", padx=(6, 0))
         ttk.Button(toolbar, text="Remover camada", command=self.delete_selected_overlay).pack(side="left", padx=(6, 10))
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=(0, 10))
         ttk.Button(toolbar, text="Anterior", command=self.prev_page).pack(side="left")
@@ -235,7 +236,7 @@ class ThermalLabelApp:
         self.preview_canvas.bind("<ButtonPress-1>", self._start_preview_action)
         self.preview_canvas.bind("<B1-Motion>", self._drag_preview_action)
         self.preview_canvas.bind("<ButtonRelease-1>", self._end_preview_action)
-        self.preview_canvas.bind("<Double-Button-1>", self._toggle_preview_mode)
+        self.preview_canvas.bind("<Double-Button-1>", self._handle_preview_double_click)
         self.preview_canvas.bind("<Motion>", self._update_preview_cursor)
         preview_frame.bind("<Configure>", lambda _event: self.schedule_preview())
         self._enable_file_drop(preview_frame)
@@ -538,6 +539,7 @@ class ThermalLabelApp:
         layers_menu.add_command(label="Adicionar texto", command=self.add_text_overlay)
         layers_menu.add_command(label="Adicionar imagem", command=self.add_image_overlay)
         layers_menu.add_command(label="Adicionar numeração", command=self.open_counter_window)
+        layers_menu.add_command(label="Editar camada selecionada", command=self.edit_selected_overlay)
         layers_menu.add_command(label="Remover camada selecionada", accelerator="Delete", command=self.delete_selected_overlay)
         menubar.add_cascade(label="Camadas", menu=layers_menu)
 
@@ -752,23 +754,92 @@ class ThermalLabelApp:
         if not self.page_sources:
             messagebox.showinfo("Camadas", "Abra um arquivo antes de adicionar texto.")
             return
-        text = simpledialog.askstring("Adicionar texto", "Texto:", parent=self.root)
+        self.open_text_window()
+
+    def open_text_window(self, overlay: dict[str, object] | None = None) -> None:
+        if not self.page_sources:
+            messagebox.showinfo("Camadas", "Abra um arquivo antes de adicionar texto.")
+            return
+        if hasattr(self, "text_window") and self.text_window.winfo_exists():
+            self.text_window.lift()
+            return
+
+        editing = overlay is not None
+        window = tk.Toplevel(self.root)
+        window.title("Editar texto" if editing else "Texto")
+        window.geometry("420x280")
+        window.minsize(420, 280)
+        window.transient(self.root)
+        window.grab_set()
+        window.configure(bg="#f1f3f4")
+        self.text_window = window
+
+        width, height = self._canvas_size_px()
+        text_var = tk.StringVar(value=str(overlay.get("text", "")) if overlay else "")
+        size_var = tk.IntVar(value=int(overlay.get("font_size", max(18, round(height * 0.035)))) if overlay else max(18, round(height * 0.035)))
+        status_var = tk.StringVar(value="Duplo clique na camada para editar depois.")
+
+        container = ttk.Frame(window, padding=12, style="App.TFrame")
+        container.pack(fill="both", expand=True)
+        ttk.Label(container, text="Texto", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(container, text="Edite o texto que será impresso por cima da página.", style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
+
+        form = ttk.Frame(container, style="App.TFrame")
+        form.pack(fill="x")
+        ttk.Label(form, text="Texto").grid(row=0, column=0, sticky="w", pady=5, padx=(0, 10))
+        text_entry = ttk.Entry(form, textvariable=text_var)
+        text_entry.grid(row=0, column=1, sticky="ew", pady=5)
+        ttk.Label(form, text="Tamanho").grid(row=1, column=0, sticky="w", pady=5, padx=(0, 10))
+        ttk.Spinbox(form, from_=6, to=300, increment=1, textvariable=size_var, width=14).grid(row=1, column=1, sticky="w", pady=5)
+        form.columnconfigure(1, weight=1)
+
+        ttk.Label(container, textvariable=status_var, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
+        actions = ttk.Frame(container, style="App.TFrame")
+        actions.pack(fill="x", side="bottom", pady=(14, 0))
+        ttk.Button(actions, text="Cancelar", width=14, command=window.destroy).pack(side="right")
+        ttk.Button(actions, text="Salvar", width=14, style="Accent.TButton", command=lambda: self.save_text_overlay_from_window(window, overlay, text_var, size_var, status_var)).pack(side="right", padx=(0, 8))
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.bind("<Return>", lambda _event: self.save_text_overlay_from_window(window, overlay, text_var, size_var, status_var))
+        text_entry.focus_set()
+
+    def save_text_overlay_from_window(
+        self,
+        window: tk.Toplevel,
+        overlay: dict[str, object] | None,
+        text_var: tk.StringVar,
+        size_var: tk.IntVar,
+        status_var: tk.StringVar,
+    ) -> None:
+        text = text_var.get().strip()
         if not text:
+            status_var.set("Digite um texto.")
+            return
+        try:
+            font_size = max(6, int(size_var.get()))
+        except (tk.TclError, ValueError):
+            status_var.set("Revise o tamanho.")
             return
         width, height = self._canvas_size_px()
-        overlay = {
-            "id": self._new_overlay_id(),
-            "type": "text",
-            "text": text,
-            "x": round(width * 0.1),
-            "y": round(height * 0.1),
-            "w": max(120, round(width * 0.35)),
-            "h": 44,
-            "font_size": max(18, round(height * 0.035)),
-        }
-        self._current_overlays().append(overlay)
+        if overlay is None:
+            overlay = {
+                "id": self._new_overlay_id(),
+                "type": "text",
+                "text": text,
+                "x": round(width * 0.1),
+                "y": round(height * 0.1),
+                "w": max(120, round(width * 0.35)),
+                "h": max(44, font_size + 12),
+                "font_size": font_size,
+            }
+            self._current_overlays().append(overlay)
+            self.status_message.set("Texto adicionado como camada.")
+        else:
+            overlay["text"] = text
+            overlay["font_size"] = font_size
+            overlay["h"] = max(float(overlay.get("h", 44)), font_size + 12)
+            self.status_message.set("Texto atualizado.")
         self.selected_overlay_id = str(overlay["id"])
-        self.status_message.set("Texto adicionado como camada.")
+        window.destroy()
         self.schedule_preview()
 
     def add_image_overlay(self) -> None:
@@ -810,7 +881,7 @@ class ThermalLabelApp:
         self.status_message.set("Imagem adicionada como camada.")
         self.schedule_preview()
 
-    def open_counter_window(self) -> None:
+    def open_counter_window(self, overlay: dict[str, object] | None = None) -> None:
         if not self.page_sources:
             messagebox.showinfo("Camadas", "Abra um arquivo antes de adicionar numeração.")
             return
@@ -818,8 +889,9 @@ class ThermalLabelApp:
             self.counter_window.lift()
             return
 
+        editing = overlay is not None
         window = tk.Toplevel(self.root)
-        window.title("Numeração")
+        window.title("Editar numeração" if editing else "Numeração")
         window.geometry("420x330")
         window.minsize(420, 330)
         window.transient(self.root)
@@ -827,11 +899,12 @@ class ThermalLabelApp:
         window.configure(bg="#f1f3f4")
         self.counter_window = window
 
-        start_var = tk.IntVar(value=1)
-        end_var = tk.IntVar(value=1500)
-        digits_var = tk.IntVar(value=0)
-        prefix_var = tk.StringVar(value="")
-        suffix_var = tk.StringVar(value="")
+        start_var = tk.IntVar(value=int(overlay.get("start", 1)) if overlay else 1)
+        end_var = tk.IntVar(value=int(overlay.get("end", 1500)) if overlay else 1500)
+        digits_var = tk.IntVar(value=int(overlay.get("digits", 0)) if overlay else 0)
+        prefix_var = tk.StringVar(value=str(overlay.get("prefix", "")) if overlay else "")
+        suffix_var = tk.StringVar(value=str(overlay.get("suffix", "")) if overlay else "")
+        size_var = tk.IntVar(value=int(overlay.get("font_size", 28)) if overlay else 28)
         status_var = tk.StringVar(value="A camada será criada na página atual.")
 
         container = ttk.Frame(window, padding=12, style="App.TFrame")
@@ -851,6 +924,8 @@ class ThermalLabelApp:
         ttk.Entry(form, textvariable=prefix_var).grid(row=3, column=1, sticky="ew", pady=5)
         ttk.Label(form, text="Sufixo").grid(row=4, column=0, sticky="w", pady=5, padx=(0, 10))
         ttk.Entry(form, textvariable=suffix_var).grid(row=4, column=1, sticky="ew", pady=5)
+        ttk.Label(form, text="Tamanho").grid(row=5, column=0, sticky="w", pady=5, padx=(0, 10))
+        ttk.Spinbox(form, from_=6, to=300, increment=1, textvariable=size_var, width=14).grid(row=5, column=1, sticky="w", pady=5)
         form.columnconfigure(1, weight=1)
 
         ttk.Label(container, textvariable=status_var, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
@@ -859,30 +934,33 @@ class ThermalLabelApp:
         ttk.Button(actions, text="Cancelar", width=14, command=window.destroy).pack(side="right")
         ttk.Button(
             actions,
-            text="Criar",
+            text="Salvar" if editing else "Criar",
             width=14,
             style="Accent.TButton",
-            command=lambda: self.add_counter_overlay_from_window(window, start_var, end_var, digits_var, prefix_var, suffix_var, status_var),
+            command=lambda: self.add_counter_overlay_from_window(window, overlay, start_var, end_var, digits_var, prefix_var, suffix_var, size_var, status_var),
         ).pack(side="right", padx=(0, 8))
         window.bind("<Escape>", lambda _event: window.destroy())
-        window.bind("<Return>", lambda _event: self.add_counter_overlay_from_window(window, start_var, end_var, digits_var, prefix_var, suffix_var, status_var))
+        window.bind("<Return>", lambda _event: self.add_counter_overlay_from_window(window, overlay, start_var, end_var, digits_var, prefix_var, suffix_var, size_var, status_var))
 
     def add_counter_overlay_from_window(
         self,
         window: tk.Toplevel,
+        overlay: dict[str, object] | None,
         start_var: tk.IntVar,
         end_var: tk.IntVar,
         digits_var: tk.IntVar,
         prefix_var: tk.StringVar,
         suffix_var: tk.StringVar,
+        size_var: tk.IntVar,
         status_var: tk.StringVar,
     ) -> None:
         try:
             start = int(start_var.get())
             end = int(end_var.get())
             digits = max(0, int(digits_var.get()))
+            font_size = max(6, int(size_var.get()))
         except (tk.TclError, ValueError):
-            status_var.set("Revise início, fim e zeros.")
+            status_var.set("Revise início, fim, zeros e tamanho.")
             return
         if end < start:
             status_var.set("O fim precisa ser maior ou igual ao início.")
@@ -891,23 +969,27 @@ class ThermalLabelApp:
             status_var.set("Limite inicial: até 10.000 folhas por sequência.")
             return
         width, height = self._canvas_size_px()
-        overlay = {
-            "id": self._new_overlay_id(),
-            "type": "counter",
-            "start": start,
-            "end": end,
-            "digits": digits,
-            "prefix": prefix_var.get(),
-            "suffix": suffix_var.get(),
-            "x": round(width * 0.1),
-            "y": round(height * 0.1),
-            "w": max(120, round(width * 0.3)),
-            "h": 48,
-            "font_size": max(20, round(height * 0.04)),
-        }
-        self._current_overlays().append(overlay)
+        if overlay is None:
+            overlay = {
+                "id": self._new_overlay_id(),
+                "type": "counter",
+                "x": round(width * 0.1),
+                "y": round(height * 0.1),
+                "w": max(120, round(width * 0.3)),
+                "h": max(48, font_size + 12),
+            }
+            self._current_overlays().append(overlay)
+            self.status_message.set(f"Numeração criada: {start} até {end}.")
+        else:
+            self.status_message.set(f"Numeração atualizada: {start} até {end}.")
+        overlay["start"] = start
+        overlay["end"] = end
+        overlay["digits"] = digits
+        overlay["prefix"] = prefix_var.get()
+        overlay["suffix"] = suffix_var.get()
+        overlay["font_size"] = font_size
+        overlay["h"] = max(float(overlay.get("h", 48)), font_size + 12)
         self.selected_overlay_id = str(overlay["id"])
-        self.status_message.set(f"Numeração criada: {start} até {end}.")
         window.destroy()
         self.schedule_preview()
 
@@ -923,6 +1005,26 @@ class ThermalLabelApp:
         self.overlay_drag_start = None
         self.status_message.set("Camada removida.")
         self.schedule_preview()
+
+    def _selected_overlay(self) -> dict[str, object] | None:
+        if not self.selected_overlay_id:
+            return None
+        for overlay in self._current_overlays():
+            if overlay.get("id") == self.selected_overlay_id:
+                return overlay
+        return None
+
+    def edit_selected_overlay(self) -> None:
+        overlay = self._selected_overlay()
+        if not overlay:
+            self.status_message.set("Selecione uma camada para editar.")
+            return
+        if overlay.get("type") == "text":
+            self.open_text_window(overlay)
+        elif overlay.get("type") == "counter":
+            self.open_counter_window(overlay)
+        elif overlay.get("type") == "image":
+            messagebox.showinfo("Camadas", "Imagem ainda permite mover/remover. Edição de imagem fica para a próxima etapa.")
 
     def _overlay_canvas_box(self, overlay: dict[str, object]) -> tuple[float, float, float, float] | None:
         if not self.preview_image_box:
@@ -949,6 +1051,16 @@ class ThermalLabelApp:
     def _toggle_preview_mode(self, _event=None) -> None:
         self.edit_mode.set("Rotacionar" if self.edit_mode.get() == "Redimensionar" else "Redimensionar")
         self._draw_selection_overlay()
+
+    def _handle_preview_double_click(self, event) -> None:
+        overlay = self._overlay_at(event.x, event.y)
+        if overlay:
+            self.selected_overlay_id = str(overlay["id"])
+            self.overlay_drag_start = None
+            self._draw_selection_overlay()
+            self.edit_selected_overlay()
+            return
+        self._toggle_preview_mode()
 
     def _point_in_preview_box(self, x: int, y: int) -> bool:
         if not self.preview_content_box:
