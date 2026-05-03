@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from thermal_label_app.printing import send_document
+from ynix_printer_modular.printing import send_document
 
 
 class CupsAdapter:

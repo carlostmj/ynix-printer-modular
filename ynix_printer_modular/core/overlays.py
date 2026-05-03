@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from thermal_label_app.domain.layer import Layer, new_layer_id
+from ynix_printer_modular.domain.layer import Layer, new_layer_id
 
 
 def normalize_overlay(overlay: dict[str, Any]) -> dict[str, Any]:

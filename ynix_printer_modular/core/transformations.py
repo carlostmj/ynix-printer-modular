@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from thermal_label_app.domain.models import Transform
+from ynix_printer_modular.domain.models import Transform
 
 
 def move(transform: Transform, dx: float, dy: float, *, snap: int = 0) -> Transform:

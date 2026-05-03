@@ -2,6 +2,6 @@ from __future__ import annotations
 
 
 def create_app(root, files):
-    from thermal_label_app.app import ThermalLabelApp
+    from ynix_printer_modular.app import ThermalLabelApp
 
     return ThermalLabelApp(root, files)

@@ -13,8 +13,11 @@ dependencies = [
 ]
 
 [project.scripts]
-ynix-printer-modular = "thermal_label_app.__main__:main"
-thermal-label-app = "thermal_label_app.__main__:main"
+ynix-printer-modular = "ynix_printer_modular.__main__:main"
+thermal-label-app = "ynix_printer_modular.__main__:main"
 
 [project.urls]
 Author = "https://github.com/carlostmj"
+
+[tool.setuptools.packages.find]
+include = ["ynix_printer_modular*"]

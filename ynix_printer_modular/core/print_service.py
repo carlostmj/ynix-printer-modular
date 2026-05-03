@@ -4,9 +4,9 @@ from dataclasses import dataclass
 from time import sleep
 from typing import Callable
 
-from thermal_label_app.infrastructure.cups_adapter import CupsAdapter
-from thermal_label_app.infrastructure.tspl_adapter import TsplAdapter
-from thermal_label_app.utils.logger import get_logger
+from ynix_printer_modular.infrastructure.cups_adapter import CupsAdapter
+from ynix_printer_modular.infrastructure.tspl_adapter import TsplAdapter
+from ynix_printer_modular.utils.logger import get_logger
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from thermal_label_app.domain.layer import Layer
+from ynix_printer_modular.domain.layer import Layer
 
 
 class Document:

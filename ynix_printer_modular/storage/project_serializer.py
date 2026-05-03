@@ -4,9 +4,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from thermal_label_app.domain.layer import Layer
-from thermal_label_app.domain.models import CanvasSpec, PrintConfig
-from thermal_label_app.domain.project import YnixProject
+from ynix_printer_modular.domain.layer import Layer
+from ynix_printer_modular.domain.models import CanvasSpec, PrintConfig
+from ynix_printer_modular.domain.project import YnixProject
 
 
 PROJECT_VERSION = 1

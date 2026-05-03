@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from PIL import Image
 
-from thermal_label_app.printing import send_raw
-from thermal_label_app.tspl import build_tspl
+from ynix_printer_modular.printing import send_raw
+from ynix_printer_modular.tspl import build_tspl
 
 
 class TsplAdapter:
