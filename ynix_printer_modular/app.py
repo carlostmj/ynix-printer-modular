@@ -5,9 +5,11 @@ import shutil
 import subprocess
 import tempfile
 import math
+import hashlib
+from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, font as tkfont, messagebox, ttk
 import tkinter as tk
 from urllib.parse import unquote, urlparse
 
@@ -22,6 +24,18 @@ from .printers import DEFAULT_CONTRACT, contract_by_display_name, contract_names
 from .profiles import LabelProfile, all_profiles, delete_custom_profile, get_profile, is_builtin_profile, profile_names, save_custom_profile
 from .quality import get_quality, quality_names
 from .tspl import build_tspl
+from .config.settings import AppSettings, load_settings, save_settings
+from .core.element_modules import ModuleField, module_for_overlay
+from .core.overlays import duplicate_overlay, normalize_overlay, reorder
+from .core.qrcode_renderer import normalize_qr_fill, render_qrcode_layer
+from .domain.layer import Layer
+from .domain.models import CanvasSpec, PrintConfig
+from .domain.project import YnixProject
+from .storage.project_serializer import load_project, save_project
+from .ui.context_menu import LayerContextMenu
+from .ui.left_toolbar import LeftToolbar
+from .ui.right_panel import LayerList
+from .utils.logger import get_logger
 
 
 SUPPORTED_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
@@ -93,6 +107,9 @@ class ThermalLabelApp:
         self.root.geometry("1240x800")
         self.app_icon_tk = None
         self._set_window_icon()
+        self.app_settings: AppSettings = load_settings()
+        self.logger = get_logger("app")
+        self.project_path: Path | None = None
 
         self.printer_name = tk.StringVar(value="Tomate_MDK_007")
         self.output_mode = tk.StringVar(value="Térmica TSPL")
@@ -104,6 +121,37 @@ class ThermalLabelApp:
         self.size_height = tk.DoubleVar(value=150.0)
         self.calculated_px = tk.StringVar(value="")
         self.status_message = tk.StringVar(value="Pronto")
+        self.active_tool = tk.StringVar(value="select")
+        self.snap_enabled = tk.BooleanVar(value=bool(self.app_settings.preferences.get("snap_enabled", False)))
+        self.grid_size = tk.IntVar(value=int(self.app_settings.preferences.get("grid_size", 16)))
+        self.layer_x = tk.DoubleVar(value=0)
+        self.layer_y = tk.DoubleVar(value=0)
+        self.layer_w = tk.DoubleVar(value=0)
+        self.layer_h = tk.DoubleVar(value=0)
+        self.layer_rotation = tk.DoubleVar(value=0)
+        self.layer_font_family = tk.StringVar(value="DejaVu Sans")
+        self.layer_font_size = tk.IntVar(value=28)
+        self.layer_bold = tk.BooleanVar(value=False)
+        self.layer_italic = tk.BooleanVar(value=False)
+        self.layer_color = tk.StringVar(value="#000000")
+        self.layer_fill_color = tk.StringVar(value="none")
+        self.layer_stroke_color = tk.StringVar(value="#000000")
+        self.layer_line_width = tk.IntVar(value=3)
+        self.layer_align = tk.StringVar(value="left")
+        self.layer_text = tk.StringVar(value="")
+        self.module_field_vars: dict[str, tk.Variable] = {}
+        self.module_field_specs: dict[str, ModuleField] = {}
+        self._module_panel_key: tuple[str, str] | None = None
+        self.maximized_enabled = tk.BooleanVar(value=True)
+        self.layer_name = tk.StringVar(value="")
+        self.layer_opacity = tk.IntVar(value=100)
+        self.layer_visible = tk.BooleanVar(value=True)
+        self.layer_locked = tk.BooleanVar(value=False)
+        self.show_grid = tk.BooleanVar(value=bool(self.app_settings.preferences.get("show_grid", False)))
+        self.show_rulers = tk.BooleanVar(value=bool(self.app_settings.preferences.get("show_rulers", True)))
+        self.mouse_position = tk.StringVar(value="")
+        self.zoom_percent = tk.IntVar(value=100)
+        self._font_families_cache: list[str] | None = None
 
         self.width_mm = 100.0
         self.height_mm = 150.0
@@ -125,7 +173,9 @@ class ThermalLabelApp:
         self.profile_status = tk.StringVar(value="")
 
         self.files = [normalize_input_path(f) for f in files if normalize_input_path(f).is_file()]
+        self.project_source_files: list[Path] = list(self.files)
         self.page_sources: list[Path] = []
+        self.blank_document = False
         self.current_index = 0
         self.tmpdir = Path(tempfile.mkdtemp(prefix="ynix-printer-modular."))
 
@@ -145,22 +195,33 @@ class ThermalLabelApp:
         self.resize_start = None
         self.rotate_start = None
         self.overlay_drag_start = None
+        self.overlay_resize_start = None
+        self.overlay_rotate_start = None
         self.edit_mode = tk.StringVar(value="Redimensionar")
         self.page_overlays: dict[int, list[dict[str, object]]] = {}
         self.selected_overlay_id: str | None = None
+        self.clipboard_overlay: dict[str, object] | None = None
+        self.overlay_undo_stack: list[dict[str, object]] = []
+        self.overlay_redo_stack: list[dict[str, object]] = []
+        self.overlay_history_paused = False
         self.next_overlay_id = 1
         self.detected_printers = list_printers()
         if self.detected_printers:
             self.printer_name.set(self.detected_printers[0])
+        if self.app_settings.last_printer:
+            self.printer_name.set(self.app_settings.last_printer)
+        if self.app_settings.last_output_mode:
+            self.output_mode.set(self.app_settings.last_output_mode)
         self.print_queue = PrintQueue(self._queue_job_changed)
 
         self._build_ui()
+        self._maximize_window()
         self._bind_auto_preview()
         self.apply_profile("10x15", refresh=False)
         if self.files:
             self.load_files(self.files)
         else:
-            self.refresh_preview()
+            self.new_blank_project()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._bind_shortcuts()
@@ -174,6 +235,37 @@ class ThermalLabelApp:
         except tk.TclError:
             pass
 
+    def _finish_dialog(self, window: tk.Toplevel, min_width: int, min_height: int) -> None:
+        window.minsize(min_width, min_height)
+        window.update_idletasks()
+        width = max(min_width, window.winfo_reqwidth() + 24)
+        height = max(min_height, window.winfo_reqheight() + 24)
+        screen_w = max(width, window.winfo_screenwidth())
+        screen_h = max(height, window.winfo_screenheight())
+        width = min(width, screen_w - 80)
+        height = min(height, screen_h - 100)
+        x = max(20, (screen_w - width) // 2)
+        y = max(20, (screen_h - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+        window.deiconify()
+        window.lift()
+        window.focus_force()
+
+    def _maximize_window(self) -> None:
+        self.maximized_enabled.set(True)
+        try:
+            self.root.attributes("-fullscreen", False)
+        except tk.TclError:
+            pass
+        try:
+            self.root.state("zoomed")
+            return
+        except tk.TclError:
+            pass
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        self.root.geometry(f"{screen_w}x{screen_h}+0+0")
+
     def _build_ui(self) -> None:
         self._configure_style()
         self._build_menu()
@@ -183,18 +275,15 @@ class ThermalLabelApp:
 
         toolbar = ttk.Frame(main, style="Toolbar.TFrame")
         toolbar.pack(fill="x", pady=(0, 6))
-        ttk.Button(toolbar, text="Abrir arquivos", style="Accent.TButton", command=self.pick_files).pack(side="left")
+        ttk.Button(toolbar, text="Novo projeto", style="Accent.TButton", command=self.new_blank_project).pack(side="left")
+        ttk.Button(toolbar, text="Abrir arquivos", command=self.pick_files).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Abrir projeto", command=self.open_project).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Salvar", command=self.save_project).pack(side="left", padx=(6, 0))
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=10)
         self.undo_button = ttk.Button(toolbar, text="Desfazer", command=self.undo_edit)
         self.undo_button.pack(side="left")
         self.redo_button = ttk.Button(toolbar, text="Refazer", command=self.redo_edit)
         self.redo_button.pack(side="left", padx=(6, 10))
-        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=(0, 10))
-        ttk.Button(toolbar, text="Texto", command=self.add_text_overlay).pack(side="left")
-        ttk.Button(toolbar, text="Imagem", command=self.add_image_overlay).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="Numerar", command=self.open_counter_window).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="Editar camada", command=self.edit_selected_overlay).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="Remover camada", command=self.delete_selected_overlay).pack(side="left", padx=(6, 10))
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=(0, 10))
         ttk.Button(toolbar, text="Anterior", command=self.prev_page).pack(side="left")
         ttk.Button(toolbar, text="Próxima", command=self.next_page).pack(side="left", padx=(6, 0))
@@ -222,6 +311,9 @@ class ThermalLabelApp:
         content = ttk.PanedWindow(main, orient="horizontal")
         content.pack(fill="both", expand=True)
 
+        self.left_toolbar = LeftToolbar(content, self.active_tool, self.set_active_tool)
+        content.add(self.left_toolbar, weight=0)
+
         preview_shell = ttk.Frame(content, padding=12, style="PreviewShell.TFrame")
         content.add(preview_shell, weight=1)
         preview_header = ttk.Frame(preview_shell, style="PreviewShell.TFrame")
@@ -237,7 +329,9 @@ class ThermalLabelApp:
         self.preview_canvas.bind("<B1-Motion>", self._drag_preview_action)
         self.preview_canvas.bind("<ButtonRelease-1>", self._end_preview_action)
         self.preview_canvas.bind("<Double-Button-1>", self._handle_preview_double_click)
+        self.preview_canvas.bind("<Button-3>", self._show_context_menu)
         self.preview_canvas.bind("<Motion>", self._update_preview_cursor)
+        self.preview_canvas.bind("<MouseWheel>", self._on_canvas_zoom)
         preview_frame.bind("<Configure>", lambda _event: self.schedule_preview())
         self._enable_file_drop(preview_frame)
         self._enable_file_drop(self.preview_canvas)
@@ -251,13 +345,14 @@ class ThermalLabelApp:
         pages = ttk.Frame(right, style="App.TFrame")
         pages.pack(fill="both", expand=True)
         self.sidebar_pages = {
+            "Camadas": ScrollableSidebarPage(pages),
             "Perfis": ScrollableSidebarPage(pages),
             "Ajustes": ScrollableSidebarPage(pages),
             "Impressão": ScrollableSidebarPage(pages),
             "Fila": ScrollableSidebarPage(pages),
         }
         self.sidebar_tab_buttons = {}
-        tab_rows = (("Perfis", "Ajustes"), ("Impressão", "Fila"))
+        tab_rows = (("Camadas", "Perfis", "Ajustes"), ("Impressão", "Fila"))
         for row_index, tab_names in enumerate(tab_rows):
             row_frame = ttk.Frame(tabbar, style="App.TFrame")
             row_frame.pack(fill="x", pady=(0, 4 if row_index == 0 else 0))
@@ -267,10 +362,13 @@ class ThermalLabelApp:
                 row_frame.columnconfigure(column_index, weight=1, uniform=f"tabs-{row_index}")
                 self.sidebar_tab_buttons[tab_name] = button
 
+        layers_tab = self.sidebar_pages["Camadas"].inner
         profiles_tab = self.sidebar_pages["Perfis"].inner
         setup_tab = self.sidebar_pages["Ajustes"].inner
         print_tab = self.sidebar_pages["Impressão"].inner
         queue_tab = self.sidebar_pages["Fila"].inner
+
+        self._build_layers_panel(layers_tab)
 
         ttk.Label(profiles_tab, text="Perfis de papel", style="Title.TLabel").pack(anchor="w")
         ttk.Label(profiles_tab, text="Escolha o tamanho base do trabalho.", style="Muted.TLabel").pack(anchor="w", pady=(2, 8))
@@ -455,6 +553,96 @@ class ThermalLabelApp:
         status.pack(fill="x", pady=(10, 0))
         ttk.Label(status, textvariable=self.status_message, style="Muted.TLabel").pack(side="left")
 
+    def _build_layers_panel(self, parent: tk.Widget) -> None:
+        ttk.Label(parent, text="Camadas", style="Title.TLabel").pack(anchor="w")
+        actions = ttk.Frame(parent, style="App.TFrame")
+        actions.pack(fill="x", pady=(8, 6))
+        ttk.Button(actions, text="Texto", command=self.add_text_overlay).pack(side="left", fill="x", expand=True)
+        ttk.Button(actions, text="Imagem", command=self.add_image_overlay).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.layer_list = LayerList(parent, self._select_layer_from_panel)
+        self.layer_list.pack(fill="x", pady=(0, 8))
+        order = ttk.Frame(parent, style="App.TFrame")
+        order.pack(fill="x")
+        ttk.Button(order, text="Frente", command=lambda: self.reorder_selected_overlay("front")).pack(side="left", fill="x", expand=True)
+        ttk.Button(order, text="Trás", command=lambda: self.reorder_selected_overlay("back")).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Button(order, text="↑", width=3, command=lambda: self.reorder_selected_overlay("up")).pack(side="left", padx=(6, 0))
+        ttk.Button(order, text="↓", width=3, command=lambda: self.reorder_selected_overlay("down")).pack(side="left", padx=(6, 0))
+        ttk.Button(parent, text="Duplicar camada", command=self.duplicate_selected_overlay).pack(fill="x", pady=(8, 0))
+        ttk.Button(parent, text="Remover camada", command=self.delete_selected_overlay).pack(fill="x", pady=(6, 12))
+
+        self.module_panel = ttk.Frame(parent, style="App.TFrame")
+        self.module_panel.pack(fill="x", pady=(0, 10))
+
+        props = ttk.LabelFrame(parent, text="Propriedades", padding=10)
+        props.pack(fill="x")
+        ttk.Label(props, text="Nome").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Entry(props, textvariable=self.layer_name).grid(row=0, column=1, sticky="ew", pady=3)
+        fields = (
+            ("X", self.layer_x),
+            ("Y", self.layer_y),
+            ("Largura", self.layer_w),
+            ("Altura", self.layer_h),
+            ("Rotação", self.layer_rotation),
+        )
+        for row, (label, var) in enumerate(fields, start=1):
+            ttk.Label(props, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Spinbox(props, from_=-5000, to=10000, increment=1, textvariable=var, width=12, command=self.apply_layer_properties).grid(row=row, column=1, sticky="ew", pady=3)
+        ttk.Label(props, text="Opacidade").grid(row=6, column=0, sticky="w", pady=3)
+        ttk.Spinbox(props, from_=0, to=100, increment=5, textvariable=self.layer_opacity, width=12, command=self.apply_layer_properties).grid(row=6, column=1, sticky="ew", pady=3)
+        ttk.Checkbutton(props, text="Visível", variable=self.layer_visible, command=self.apply_layer_properties).grid(row=7, column=0, sticky="w", pady=3)
+        ttk.Checkbutton(props, text="Bloquear", variable=self.layer_locked, command=self.apply_layer_properties).grid(row=7, column=1, sticky="w", pady=3)
+        ttk.Label(props, text="Fonte").grid(row=8, column=0, sticky="w", pady=3)
+        font_values = self._font_family_values()
+        ttk.Combobox(props, textvariable=self.layer_font_family, values=font_values, width=18).grid(row=8, column=1, sticky="ew", pady=3)
+        ttk.Label(props, text="Tamanho").grid(row=9, column=0, sticky="w", pady=3)
+        ttk.Spinbox(props, from_=6, to=300, increment=1, textvariable=self.layer_font_size, width=12, command=self.apply_layer_properties).grid(row=9, column=1, sticky="ew", pady=3)
+        ttk.Checkbutton(props, text="Negrito", variable=self.layer_bold, command=self.apply_layer_properties).grid(row=10, column=0, sticky="w", pady=3)
+        ttk.Checkbutton(props, text="Itálico", variable=self.layer_italic, command=self.apply_layer_properties).grid(row=10, column=1, sticky="w", pady=3)
+        ttk.Label(props, text="Alinhamento").grid(row=11, column=0, sticky="w", pady=3)
+        ttk.Combobox(props, textvariable=self.layer_align, values=["left", "center", "right"], state="readonly").grid(row=11, column=1, sticky="ew", pady=3)
+        color_row = ttk.Frame(props, style="App.TFrame")
+        color_row.grid(row=12, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(color_row, text="Cor", command=self.pick_layer_color).pack(side="left")
+        ttk.Label(color_row, textvariable=self.layer_color, style="Value.TLabel").pack(side="left", padx=(8, 0))
+        shape_color_row = ttk.Frame(props, style="App.TFrame")
+        shape_color_row.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(shape_color_row, text="Linha", command=self.pick_stroke_color).pack(side="left")
+        ttk.Label(shape_color_row, textvariable=self.layer_stroke_color, style="Value.TLabel").pack(side="left", padx=(6, 10))
+        ttk.Button(shape_color_row, text="Fundo", command=self.pick_fill_color).pack(side="left")
+        ttk.Label(shape_color_row, textvariable=self.layer_fill_color, style="Value.TLabel").pack(side="left", padx=(6, 0))
+        ttk.Label(props, text="Espessura").grid(row=14, column=0, sticky="w", pady=3)
+        ttk.Spinbox(props, from_=1, to=40, increment=1, textvariable=self.layer_line_width, width=12, command=self.apply_layer_properties).grid(row=14, column=1, sticky="ew", pady=3)
+        ttk.Label(props, text="Texto / dados").grid(row=15, column=0, sticky="w", pady=3)
+        ttk.Entry(props, textvariable=self.layer_text).grid(row=15, column=1, sticky="ew", pady=3)
+
+        align_box = ttk.LabelFrame(parent, text="Alinhar e distribuir", padding=8)
+        align_box.pack(fill="x", pady=(10, 0))
+        for index, (label, action) in enumerate((("Esq", "left"), ("Centro H", "center_h"), ("Dir", "right"), ("Topo", "top"), ("Centro V", "center_v"), ("Base", "bottom"))):
+            ttk.Button(align_box, text=label, command=lambda value=action: self.align_selected_overlay(value)).grid(row=index // 3, column=index % 3, sticky="ew", padx=2, pady=2)
+        ttk.Button(align_box, text="Distribuir H", command=lambda: self.distribute_overlays("horizontal")).grid(row=2, column=0, columnspan=3, sticky="ew", pady=2)
+        ttk.Button(align_box, text="Distribuir V", command=lambda: self.distribute_overlays("vertical")).grid(row=3, column=0, columnspan=3, sticky="ew", pady=2)
+        for col in range(3):
+            align_box.columnconfigure(col, weight=1)
+
+        transform_box = ttk.LabelFrame(parent, text="Transformar", padding=8)
+        transform_box.pack(fill="x", pady=(10, 0))
+        ttk.Button(transform_box, text="Espelhar H", command=lambda: self.flip_selected_overlay("horizontal")).pack(side="left", fill="x", expand=True)
+        ttk.Button(transform_box, text="Espelhar V", command=lambda: self.flip_selected_overlay("vertical")).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Button(parent, text="Resetar transformação", command=self.reset_selected_transform).pack(fill="x", pady=(6, 0))
+
+        view_box = ttk.LabelFrame(parent, text="Área de trabalho", padding=8)
+        view_box.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(view_box, text="Grade discreta", variable=self.show_grid, command=self._save_preferences).pack(anchor="w")
+        ttk.Checkbutton(view_box, text="Réguas", variable=self.show_rulers, command=self._save_preferences).pack(anchor="w")
+        ttk.Label(view_box, textvariable=self.mouse_position, style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(parent, text="Snap à grade", variable=self.snap_enabled, command=self._save_preferences).pack(anchor="w", pady=(10, 2))
+        snap_row = ttk.Frame(parent, style="App.TFrame")
+        snap_row.pack(fill="x")
+        ttk.Label(snap_row, text="Grade").pack(side="left")
+        ttk.Spinbox(snap_row, from_=2, to=96, increment=1, textvariable=self.grid_size, width=8, command=self._save_preferences).pack(side="left", padx=(8, 0))
+        ttk.Button(parent, text="Aplicar propriedades", style="Accent.TButton", command=self.apply_layer_properties).pack(fill="x", pady=(10, 0))
+        props.columnconfigure(1, weight=1)
+
     def _configure_style(self) -> None:
         style = ttk.Style(self.root)
         try:
@@ -501,6 +689,11 @@ class ThermalLabelApp:
         style.map("Tab.TButton", padding=[("pressed", (10, 7)), ("active", (10, 7)), ("!active", (10, 7))], background=[("active", "#dadce0")])
         style.configure("SelectedTab.TButton", background="#ffffff", foreground=text, padding=(10, 7), borderwidth=1, focusthickness=0, focuscolor=bg)
         style.map("SelectedTab.TButton", padding=[("pressed", (10, 7)), ("active", (10, 7)), ("!active", (10, 7))], background=[("active", "#ffffff")])
+        style.configure("LeftToolbar.TFrame", background="#202124")
+        style.configure("Tool.TButton", background="#3c4043", foreground="#ffffff", padding=(5, 8), borderwidth=1)
+        style.map("Tool.TButton", background=[("active", "#5f6368")], foreground=[("disabled", "#9aa0a6")])
+        style.configure("SelectedTool.TButton", background="#8ab4f8", foreground="#202124", padding=(5, 8), borderwidth=1)
+        style.map("SelectedTool.TButton", background=[("active", "#aecbfa")])
         style.configure("Accent.TButton", background=accent, foreground="#ffffff", padding=(12, 7), borderwidth=1, focusthickness=0, focuscolor=bg)
         style.map(
             "Accent.TButton",
@@ -512,7 +705,11 @@ class ThermalLabelApp:
     def _build_menu(self) -> None:
         menubar = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="Novo projeto em branco", accelerator="Ctrl+N", command=self.new_blank_project)
         file_menu.add_command(label="Abrir arquivos...", accelerator="Ctrl+O", command=self.pick_files)
+        file_menu.add_command(label="Abrir projeto...", accelerator="Ctrl+Shift+O", command=self.open_project)
+        file_menu.add_command(label="Salvar projeto", accelerator="Ctrl+S", command=self.save_project)
+        file_menu.add_command(label="Salvar projeto como...", accelerator="Ctrl+Shift+S", command=self.save_project_as)
         file_menu.add_separator()
         file_menu.add_command(label="Sair", command=self.on_close)
         menubar.add_cascade(label="Arquivo", menu=file_menu)
@@ -540,8 +737,32 @@ class ThermalLabelApp:
         layers_menu.add_command(label="Adicionar imagem", command=self.add_image_overlay)
         layers_menu.add_command(label="Adicionar numeração", command=self.open_counter_window)
         layers_menu.add_command(label="Editar camada selecionada", command=self.edit_selected_overlay)
+        layers_menu.add_separator()
+        layers_menu.add_command(label="Trazer para frente", command=lambda: self.reorder_selected_overlay("front"))
+        layers_menu.add_command(label="Enviar para trás", command=lambda: self.reorder_selected_overlay("back"))
+        layers_menu.add_command(label="Mover acima", command=lambda: self.reorder_selected_overlay("up"))
+        layers_menu.add_command(label="Mover abaixo", command=lambda: self.reorder_selected_overlay("down"))
+        layers_menu.add_command(label="Duplicar camada", command=self.duplicate_selected_overlay)
         layers_menu.add_command(label="Remover camada selecionada", accelerator="Delete", command=self.delete_selected_overlay)
         menubar.add_cascade(label="Camadas", menu=layers_menu)
+
+        object_menu = tk.Menu(menubar, tearoff=False)
+        object_menu.add_command(label="Retângulo", command=lambda: self.set_active_tool("rect"))
+        object_menu.add_command(label="Círculo", command=lambda: self.set_active_tool("ellipse"))
+        object_menu.add_command(label="Linha", command=lambda: self.set_active_tool("line"))
+        object_menu.add_separator()
+        object_menu.add_command(label="Alinhar à esquerda", command=lambda: self.align_selected_overlay("left"))
+        object_menu.add_command(label="Centralizar horizontal", command=lambda: self.align_selected_overlay("center_h"))
+        object_menu.add_command(label="Alinhar à direita", command=lambda: self.align_selected_overlay("right"))
+        object_menu.add_command(label="Alinhar ao topo", command=lambda: self.align_selected_overlay("top"))
+        object_menu.add_command(label="Centralizar vertical", command=lambda: self.align_selected_overlay("center_v"))
+        object_menu.add_command(label="Alinhar à base", command=lambda: self.align_selected_overlay("bottom"))
+        menubar.add_cascade(label="Objeto", menu=object_menu)
+
+        export_menu = tk.Menu(menubar, tearoff=False)
+        export_menu.add_command(label="Exportar PNG...", command=lambda: self.export_current("png"))
+        export_menu.add_command(label="Exportar PDF...", command=lambda: self.export_current("pdf"))
+        menubar.add_cascade(label="Exportar", menu=export_menu)
 
         tools_menu = tk.Menu(menubar, tearoff=False)
         tools_menu.add_command(label="Driver Tomate / CUPS...", command=self.open_driver_window)
@@ -550,7 +771,11 @@ class ThermalLabelApp:
         self.root.config(menu=menubar)
 
     def _bind_shortcuts(self) -> None:
+        self.root.bind_all("<Control-n>", lambda _event: self.new_blank_project())
         self.root.bind_all("<Control-o>", lambda _event: self.pick_files())
+        self.root.bind_all("<Control-O>", lambda _event: self.open_project())
+        self.root.bind_all("<Control-s>", lambda _event: self.save_project())
+        self.root.bind_all("<Control-S>", lambda _event: self.save_project_as())
         self.root.bind_all("<Control-p>", lambda _event: self.print_current())
         self.root.bind_all("<Control-P>", lambda _event: self.print_all())
         self.root.bind_all("<Control-Left>", lambda _event: self.prev_page())
@@ -559,6 +784,12 @@ class ThermalLabelApp:
         self.root.bind_all("<Control-z>", lambda _event: self.undo_edit())
         self.root.bind_all("<Control-y>", lambda _event: self.redo_edit())
         self.root.bind_all("<Control-Z>", lambda _event: self.redo_edit())
+        self.root.bind_all("<Control-c>", lambda _event: self.copy_selected_overlay())
+        self.root.bind_all("<Control-v>", lambda _event: self.paste_overlay())
+        self.root.bind_all("<Control-d>", lambda _event: self.duplicate_selected_overlay())
+        self.root.bind_all("<Control-a>", lambda _event: self.select_all_overlays())
+        self.root.bind_all("<Control-g>", lambda _event: self.status_message.set("Agrupamento preparado na arquitetura; seleção múltipla completa vem na próxima etapa."))
+        self.root.bind_all("<Control-G>", lambda _event: self.status_message.set("Desagrupar preparado na arquitetura."))
         self.root.bind_all("<Control-0>", lambda _event: self.reset_scale())
         self.root.bind_all("<Control-parenright>", lambda _event: self.reset_crop())
         self.root.bind_all("<Delete>", lambda _event: self.delete_selected_overlay())
@@ -710,6 +941,53 @@ class ThermalLabelApp:
             self.sidebar_tab_buttons[tab_name].configure(style=style)
         self.sidebar_pages[name].pack(fill="both", expand=True)
 
+    def _has_document(self) -> bool:
+        return self.blank_document or bool(self.page_sources)
+
+    def _page_count(self) -> int:
+        return 1 if self.blank_document else len(self.page_sources)
+
+    def _font_family_values(self) -> list[str]:
+        if self._font_families_cache is not None:
+            return self._font_families_cache
+        fallback = ["DejaVu Sans", "Arial", "Liberation Sans", "Noto Sans"]
+        try:
+            values = sorted(set(str(name) for name in tkfont.families() if str(name).strip()))
+        except tk.TclError:
+            values = []
+        self._font_families_cache = values or fallback
+        return self._font_families_cache
+
+    def set_active_tool(self, tool: str) -> None:
+        self.active_tool.set(tool)
+        if hasattr(self, "left_toolbar"):
+            self.left_toolbar.refresh()
+        if tool == "text":
+            self.status_message.set("Ferramenta texto: clique no canvas para criar texto.")
+        elif tool == "image":
+            self.add_image_overlay()
+            self.active_tool.set("select")
+            self.left_toolbar.refresh()
+        elif tool in {"rect", "ellipse", "line", "barcode", "qrcode"}:
+            labels = {"rect": "retângulo", "ellipse": "círculo", "line": "linha", "barcode": "código de barras", "qrcode": "QR Code"}
+            self.status_message.set(f"Ferramenta {labels[tool]}: clique no canvas para criar.")
+        else:
+            self.status_message.set("Ferramenta ativa: seleção." if tool == "select" else "Ferramenta ativa: mover.")
+
+    def _snap_value(self, value: float) -> float:
+        if not bool(self.snap_enabled.get()):
+            return value
+        size = max(2, int(self.grid_size.get()))
+        return round(value / size) * size
+
+    def _save_preferences(self) -> None:
+        self.app_settings.preferences["snap_enabled"] = bool(self.snap_enabled.get())
+        self.app_settings.preferences["grid_size"] = int(self.grid_size.get())
+        self.app_settings.preferences["show_grid"] = bool(self.show_grid.get())
+        self.app_settings.preferences["show_rulers"] = bool(self.show_rulers.get())
+        save_settings(self.app_settings)
+        self.schedule_preview()
+
     def _enable_file_drop(self, widget) -> None:
         if not hasattr(widget, "drop_target_register"):
             return
@@ -724,13 +1002,13 @@ class ThermalLabelApp:
             self.status_message.set("Arrastar arquivo requer tkinterdnd2 nesta sessão.")
 
     def _on_drag_enter(self, _event=None):
-        if not self.page_sources:
+        if not self._has_document():
             self._draw_empty_preview("Solte o PDF ou imagem aqui")
         return "copy"
 
     def _on_drag_leave(self, _event=None):
-        if not self.page_sources:
-            self._draw_empty_preview("Arraste um PDF/imagem para cá ou use Abrir arquivos.")
+        if not self._has_document():
+            self._draw_empty_preview("Novo projeto em branco ou arraste um PDF/imagem.")
         return "copy"
 
     def _on_files_dropped(self, event) -> str:
@@ -750,15 +1028,495 @@ class ThermalLabelApp:
     def _current_overlays(self) -> list[dict[str, object]]:
         return self.page_overlays.setdefault(self.current_index, [])
 
-    def add_text_overlay(self) -> None:
-        if not self.page_sources:
-            messagebox.showinfo("Camadas", "Abra um arquivo antes de adicionar texto.")
+    def _overlay_snapshot(self) -> dict[str, object]:
+        return {
+            "page_overlays": deepcopy(self.page_overlays),
+            "selected_overlay_id": self.selected_overlay_id,
+        }
+
+    def _restore_overlay_snapshot(self, snapshot: dict[str, object]) -> None:
+        self.overlay_history_paused = True
+        try:
+            self.page_overlays = deepcopy(snapshot.get("page_overlays", {}))
+            self.selected_overlay_id = snapshot.get("selected_overlay_id") if isinstance(snapshot.get("selected_overlay_id"), str) else None
+        finally:
+            self.overlay_history_paused = False
+        self._sync_layer_panel()
+        self.schedule_preview()
+
+    def _record_overlay_history(self) -> None:
+        if self.overlay_history_paused:
             return
-        self.open_text_window()
+        self.overlay_undo_stack.append(self._overlay_snapshot())
+        if len(self.overlay_undo_stack) > 100:
+            self.overlay_undo_stack.pop(0)
+        self.overlay_redo_stack.clear()
+        self._update_history_buttons()
+
+    def undo_overlay_edit(self) -> bool:
+        if not self.overlay_undo_stack:
+            return False
+        self.overlay_redo_stack.append(self._overlay_snapshot())
+        self._restore_overlay_snapshot(self.overlay_undo_stack.pop())
+        self.status_message.set("Ação de camada desfeita.")
+        self._update_history_buttons()
+        return True
+
+    def redo_overlay_edit(self) -> bool:
+        if not self.overlay_redo_stack:
+            return False
+        self.overlay_undo_stack.append(self._overlay_snapshot())
+        self._restore_overlay_snapshot(self.overlay_redo_stack.pop())
+        self.status_message.set("Ação de camada refeita.")
+        self._update_history_buttons()
+        return True
+
+    def _canvas_point_from_event(self, event) -> tuple[float, float] | None:
+        if not self.preview_image_box:
+            return None
+        x1, y1, _x2, _y2 = self.preview_image_box
+        border = 2
+        scale = max(self.preview_scale, 0.01)
+        return ((event.x - x1 - border) / scale, (event.y - y1 - border) / scale)
+
+    def _create_text_at_event(self, event) -> None:
+        point = self._canvas_point_from_event(event)
+        if not point:
+            return
+        self._record_overlay_history()
+        width, height = self._canvas_size_px()
+        x = self._snap_value(point[0])
+        y = self._snap_value(point[1])
+        font_size = max(18, round(height * 0.035))
+        overlay = {
+            "id": self._new_overlay_id(),
+            "type": "text",
+            "name": "Texto",
+            "text": "Texto",
+            "x": max(0, round(x)),
+            "y": max(0, round(y)),
+            "w": max(140, round(width * 0.25)),
+            "h": max(44, font_size + 12),
+            "font_size": font_size,
+            "font_family": self.layer_font_family.get(),
+            "bold": bool(self.layer_bold.get()),
+            "italic": bool(self.layer_italic.get()),
+            "color": self.layer_color.get(),
+            "align": self.layer_align.get(),
+            "rotation": 0,
+        }
+        self._current_overlays().append(overlay)
+        self.selected_overlay_id = str(overlay["id"])
+        self._sync_layer_panel()
+        self._show_sidebar_tab("Camadas")
+        self.status_message.set("Texto criado. Edite o conteúdo no painel Camadas ou dê duplo clique.")
+        self.schedule_preview()
+
+    def _create_shape_at_event(self, event, shape_type: str) -> None:
+        point = self._canvas_point_from_event(event)
+        if not point:
+            return
+        self._record_overlay_history()
+        width, height = self._canvas_size_px()
+        x = max(0, round(self._snap_value(point[0])))
+        y = max(0, round(self._snap_value(point[1])))
+        square_size = max(80, round(min(width, height) * 0.18))
+        defaults = {
+            "rect": ("Quadrado", square_size, square_size),
+            "ellipse": ("Círculo", max(70, round(width * 0.14)), max(70, round(width * 0.14))),
+            "line": ("Linha", max(120, round(width * 0.25)), 4),
+            "barcode": ("Código de barras", max(180, round(width * 0.35)), 70),
+            "qrcode": ("QR Code", 110, 110),
+        }
+        name, w, h = defaults[shape_type]
+        overlay = {
+            "id": self._new_overlay_id(),
+            "type": "shape",
+            "shape": shape_type,
+            "name": name,
+            "x": x,
+            "y": y,
+            "w": w,
+            "h": h,
+            "rotation": 0,
+            "color": "#000000",
+            "stroke_color": "#000000",
+            "fill_color": "none",
+            "line_width": 3,
+            "visible": True,
+            "locked": False,
+            "opacity": 100,
+        }
+        if shape_type in {"barcode", "qrcode"}:
+            overlay["data"] = "YNIX"
+        self._current_overlays().append(overlay)
+        self.selected_overlay_id = str(overlay["id"])
+        self._sync_layer_panel()
+        self._show_sidebar_tab("Camadas")
+        self.set_active_tool("select")
+        self.schedule_preview()
+
+    def _select_layer_from_panel(self, layer_id: str) -> None:
+        if self.selected_overlay_id == layer_id:
+            return
+        self.selected_overlay_id = layer_id
+        self._sync_layer_panel()
+        self._draw_selection_overlay()
+
+    def _sync_layer_panel(self, *, update_module: bool = True, update_list: bool = True) -> None:
+        overlay = self._selected_overlay()
+        if overlay:
+            self.layer_name.set(str(overlay.get("name", "")))
+            self.layer_x.set(round(float(overlay.get("x", 0)), 2))
+            self.layer_y.set(round(float(overlay.get("y", 0)), 2))
+            self.layer_w.set(round(float(overlay.get("w", 0)), 2))
+            self.layer_h.set(round(float(overlay.get("h", 0)), 2))
+            self.layer_rotation.set(round(float(overlay.get("rotation", 0)), 2))
+            self.layer_font_family.set(str(overlay.get("font_family", "DejaVu Sans")))
+            self.layer_font_size.set(int(overlay.get("font_size", 28)))
+            self.layer_bold.set(bool(overlay.get("bold", False)))
+            self.layer_italic.set(bool(overlay.get("italic", False)))
+            self.layer_color.set(str(overlay.get("color", "#000000")))
+            self.layer_stroke_color.set(str(overlay.get("stroke_color", overlay.get("color", "#000000"))))
+            self.layer_fill_color.set(str(overlay.get("fill_color", "none")))
+            self.layer_line_width.set(int(float(overlay.get("line_width", 3))))
+            self.layer_align.set(str(overlay.get("align", "left")))
+            if overlay.get("type") == "text":
+                self.layer_text.set(str(overlay.get("text", "")))
+            elif overlay.get("type") == "shape" and overlay.get("shape") in {"barcode", "qrcode"}:
+                self.layer_text.set(str(overlay.get("data", "")))
+            else:
+                self.layer_text.set("")
+            self.layer_opacity.set(int(float(overlay.get("opacity", 100))))
+            self.layer_visible.set(bool(overlay.get("visible", True)))
+            self.layer_locked.set(bool(overlay.get("locked", False)))
+        if update_list and hasattr(self, "layer_list"):
+            self.layer_list.set_layers(self._current_overlays(), self.selected_overlay_id)
+        if update_module:
+            self._render_module_panel(overlay)
+
+    def _module_var_for_field(self, field: ModuleField, value: object) -> tk.Variable:
+        if field.kind == "bool":
+            return tk.BooleanVar(value=bool(value))
+        if field.kind == "int":
+            try:
+                return tk.IntVar(value=int(value))
+            except (TypeError, ValueError, tk.TclError):
+                return tk.IntVar(value=int(field.default or 0))
+        return tk.StringVar(value=str(value))
+
+    def _render_module_panel(self, overlay: dict[str, object] | None) -> None:
+        if not hasattr(self, "module_panel"):
+            return
+        module = module_for_overlay(overlay)
+        key = (str(overlay.get("id")), module.id) if overlay and module else None
+        if key == self._module_panel_key:
+            return
+        self._module_panel_key = key
+        for child in self.module_panel.winfo_children():
+            child.destroy()
+        self.module_field_vars.clear()
+        self.module_field_specs.clear()
+        if not module or overlay is None:
+            return
+        box = ttk.LabelFrame(self.module_panel, text=module.title, padding=8)
+        box.pack(fill="x")
+        for row, field in enumerate(module.fields):
+            value = overlay.get(field.key, field.default)
+            var = self._module_var_for_field(field, value)
+            self.module_field_vars[field.key] = var
+            self.module_field_specs[field.key] = field
+            ttk.Label(box, text=field.label).grid(row=row, column=0, sticky="w", pady=3, padx=(0, 8))
+            if field.kind == "choice":
+                choices = field.choices
+                if field.key == "font_family":
+                    choices = tuple(self._font_family_values())
+                ttk.Combobox(box, textvariable=var, values=choices, width=22).grid(row=row, column=1, sticky="ew", pady=3)
+            elif field.kind == "int":
+                ttk.Spinbox(box, from_=field.min_value, to=field.max_value, increment=1, textvariable=var, width=12).grid(row=row, column=1, sticky="ew", pady=3)
+            elif field.kind == "bool":
+                ttk.Checkbutton(box, variable=var).grid(row=row, column=1, sticky="w", pady=3)
+            elif field.kind == "color":
+                row_frame = ttk.Frame(box, style="App.TFrame")
+                row_frame.grid(row=row, column=1, sticky="ew", pady=3)
+                ttk.Entry(row_frame, textvariable=var).pack(side="left", fill="x", expand=True)
+                ttk.Button(row_frame, text="...", width=3, command=lambda key=field.key: self.pick_module_color(key)).pack(side="left", padx=(6, 0))
+            else:
+                ttk.Entry(box, textvariable=var).grid(row=row, column=1, sticky="ew", pady=3)
+        box.columnconfigure(1, weight=1)
+        ttk.Button(box, text=f"Aplicar {module.title}", style="Accent.TButton", command=self.apply_module_properties).grid(
+            row=len(module.fields),
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(8, 0),
+        )
+
+    def pick_module_color(self, key: str) -> None:
+        var = self.module_field_vars.get(key)
+        if not var:
+            return
+        current = str(var.get())
+        color = colorchooser.askcolor(color="#ffffff" if current == "none" else current, title="Cor")
+        if color and color[1]:
+            var.set(color[1])
+
+    def apply_module_properties(self) -> None:
+        overlay = self._selected_overlay()
+        if not overlay:
+            return
+        self._record_overlay_history()
+        try:
+            for key, var in self.module_field_vars.items():
+                field = self.module_field_specs[key]
+                if field.kind == "int":
+                    value = max(field.min_value, min(field.max_value, int(var.get())))
+                elif field.kind == "bool":
+                    value = bool(var.get())
+                else:
+                    value = str(var.get())
+                overlay[key] = value
+            if overlay.get("type") == "text":
+                overlay["name"] = str(overlay.get("text", "") or "Texto")[:24]
+                self._autosize_text_overlay(overlay)
+            elif overlay.get("type") == "counter":
+                self._autosize_text_overlay(overlay)
+            elif overlay.get("type") == "shape" and overlay.get("shape") in {"qrcode", "barcode"}:
+                overlay["data"] = str(overlay.get("data", "")).strip() or "YNIX"
+            if "stroke_color" in overlay:
+                overlay["color"] = overlay["stroke_color"]
+        except (tk.TclError, ValueError) as exc:
+            messagebox.showerror("Módulo", f"Revise os campos do módulo:\n{exc}")
+            return
+        self._sync_layer_panel()
+        self.schedule_preview()
+        self.status_message.set("Módulo atualizado.")
+
+    def apply_layer_properties(self) -> None:
+        overlay = self._selected_overlay()
+        if not overlay:
+            return
+        self._record_overlay_history()
+        try:
+            overlay["name"] = self.layer_name.get().strip() or str(overlay.get("name") or "Camada")
+            overlay["x"] = round(self._snap_value(float(self.layer_x.get())), 2)
+            overlay["y"] = round(self._snap_value(float(self.layer_y.get())), 2)
+            overlay["w"] = max(4, round(float(self.layer_w.get()), 2))
+            overlay["h"] = max(4, round(float(self.layer_h.get()), 2))
+            overlay["rotation"] = round(float(self.layer_rotation.get()), 2)
+            overlay["font_family"] = self.layer_font_family.get()
+            overlay["font_size"] = max(6, int(self.layer_font_size.get()))
+            overlay["bold"] = bool(self.layer_bold.get())
+            overlay["italic"] = bool(self.layer_italic.get())
+            overlay["color"] = self.layer_color.get()
+            overlay["stroke_color"] = self.layer_stroke_color.get()
+            overlay["fill_color"] = self.layer_fill_color.get()
+            overlay["line_width"] = max(1, int(self.layer_line_width.get()))
+            overlay["align"] = self.layer_align.get()
+            overlay["opacity"] = max(0, min(100, int(self.layer_opacity.get())))
+            overlay["visible"] = bool(self.layer_visible.get())
+            overlay["locked"] = bool(self.layer_locked.get())
+            if overlay.get("type") == "text":
+                overlay["text"] = self.layer_text.get()
+                overlay["name"] = self.layer_text.get()[:24] or "Texto"
+                self._autosize_text_overlay(overlay)
+            elif overlay.get("type") == "shape" and overlay.get("shape") in {"barcode", "qrcode"}:
+                overlay["data"] = self.layer_text.get().strip() or "YNIX"
+        except (tk.TclError, ValueError):
+            return
+        self._sync_layer_panel()
+        self.schedule_preview()
+
+    def pick_layer_color(self) -> None:
+        color = colorchooser.askcolor(color=self.layer_color.get(), title="Cor da camada")
+        if color and color[1]:
+            self.layer_color.set(color[1])
+            self.layer_stroke_color.set(color[1])
+            self.apply_layer_properties()
+
+    def pick_stroke_color(self) -> None:
+        color = colorchooser.askcolor(color=self.layer_stroke_color.get(), title="Cor da linha")
+        if color and color[1]:
+            self.layer_stroke_color.set(color[1])
+            self.layer_color.set(color[1])
+            self.apply_layer_properties()
+
+    def pick_fill_color(self) -> None:
+        current = self.layer_fill_color.get()
+        color = colorchooser.askcolor(color="#ffffff" if current == "none" else current, title="Cor do fundo")
+        if color and color[1]:
+            self.layer_fill_color.set(color[1])
+            self.apply_layer_properties()
+
+    def reorder_selected_overlay(self, action: str) -> None:
+        if not self.selected_overlay_id:
+            return
+        self._record_overlay_history()
+        if reorder(self._current_overlays(), self.selected_overlay_id, action):
+            self._sync_layer_panel()
+            self.schedule_preview()
+
+    def duplicate_selected_overlay(self) -> None:
+        overlay = self._selected_overlay()
+        if not overlay:
+            return
+        self._record_overlay_history()
+        clone = duplicate_overlay(overlay)
+        self._current_overlays().append(clone)
+        self.selected_overlay_id = str(clone["id"])
+        self._sync_layer_panel()
+        self.schedule_preview()
+
+    def copy_selected_overlay(self) -> None:
+        overlay = self._selected_overlay()
+        if overlay:
+            self.clipboard_overlay = deepcopy(overlay)
+            self.status_message.set("Camada copiada.")
+
+    def paste_overlay(self) -> None:
+        if not self.clipboard_overlay:
+            return
+        self._record_overlay_history()
+        clone = duplicate_overlay(self.clipboard_overlay)
+        self._current_overlays().append(clone)
+        self.selected_overlay_id = str(clone["id"])
+        self._sync_layer_panel()
+        self.schedule_preview()
+
+    def select_all_overlays(self) -> None:
+        overlays = self._current_overlays()
+        if overlays:
+            self.selected_overlay_id = str(overlays[-1].get("id"))
+            self._sync_layer_panel()
+            self._draw_selection_overlay()
+            self.status_message.set(f"{len(overlays)} camada(s) no documento. Seleção múltipla completa preparada para próxima etapa.")
+
+    def _show_context_menu(self, event) -> None:
+        selected_overlay = self._selected_overlay()
+        overlay = selected_overlay if selected_overlay and self._overlay_handle_at(selected_overlay, event.x, event.y) else self._overlay_at(event.x, event.y)
+        if not overlay:
+            return
+        self.selected_overlay_id = str(overlay["id"])
+        self._sync_layer_panel()
+        self._draw_selection_overlay()
+        if not hasattr(self, "context_menu"):
+            self.context_menu = LayerContextMenu(self.preview_canvas, self._handle_context_action)
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+
+    def _handle_context_action(self, action: str) -> None:
+        if action == "edit":
+            self.edit_selected_overlay()
+        elif action == "duplicate":
+            self.duplicate_selected_overlay()
+        elif action == "delete":
+            self.delete_selected_overlay()
+        else:
+            self.reorder_selected_overlay(action)
+
+    def align_selected_overlay(self, action: str) -> None:
+        overlay = self._selected_overlay()
+        if not overlay:
+            return
+        self._record_overlay_history()
+        width, height = self._canvas_size_px()
+        w = float(overlay.get("w", 1))
+        h = float(overlay.get("h", 1))
+        if action == "left":
+            overlay["x"] = 0
+        elif action == "right":
+            overlay["x"] = max(0, width - w)
+        elif action == "center_h":
+            overlay["x"] = max(0, (width - w) / 2)
+        elif action == "top":
+            overlay["y"] = 0
+        elif action == "bottom":
+            overlay["y"] = max(0, height - h)
+        elif action == "center_v":
+            overlay["y"] = max(0, (height - h) / 2)
+        self._sync_layer_panel()
+        self.schedule_preview()
+
+    def distribute_overlays(self, axis: str) -> None:
+        overlays = [overlay for overlay in self._current_overlays() if overlay.get("visible", True) and not overlay.get("locked", False)]
+        if len(overlays) < 3:
+            self.status_message.set("Distribuição precisa de pelo menos 3 camadas desbloqueadas.")
+            return
+        self._record_overlay_history()
+        key = "x" if axis == "horizontal" else "y"
+        size_key = "w" if axis == "horizontal" else "h"
+        overlays.sort(key=lambda item: float(item.get(key, 0)))
+        first = float(overlays[0].get(key, 0))
+        last = float(overlays[-1].get(key, 0))
+        total_size = sum(float(item.get(size_key, 0)) for item in overlays)
+        available = max(0.0, last + float(overlays[-1].get(size_key, 0)) - first - total_size)
+        gap = available / (len(overlays) - 1)
+        cursor = first
+        for overlay in overlays:
+            overlay[key] = round(cursor, 2)
+            cursor += float(overlay.get(size_key, 0)) + gap
+        self._sync_layer_panel()
+        self.schedule_preview()
+
+    def flip_selected_overlay(self, axis: str) -> None:
+        overlay = self._selected_overlay()
+        if not overlay:
+            return
+        self._record_overlay_history()
+        overlay["flip_x" if axis == "horizontal" else "flip_y"] = not bool(overlay.get("flip_x" if axis == "horizontal" else "flip_y", False))
+        self.schedule_preview()
+
+    def reset_selected_transform(self) -> None:
+        overlay = self._selected_overlay()
+        if not overlay:
+            return
+        self._record_overlay_history()
+        overlay["rotation"] = 0
+        overlay["flip_x"] = False
+        overlay["flip_y"] = False
+        self._sync_layer_panel()
+        self.schedule_preview()
+
+    def add_text_overlay(self) -> None:
+        if not self._has_document():
+            self.new_blank_project()
+            if not self._has_document():
+                return
+        self.set_active_tool("text")
+
+    def _require_document_for_layer(self) -> bool:
+        if self._has_document():
+            return True
+        self.new_blank_project()
+        return self._has_document()
+
+    def _ensure_blank_canvas_message(self) -> None:
+        if self.blank_document:
+            self.status_message.set("Projeto em branco pronto para editar.")
+
+    def _open_text_window_requires_document(self) -> bool:
+        if self._has_document():
+            return True
+        messagebox.showinfo("Camadas", "Crie um projeto em branco ou abra um arquivo antes de editar texto.")
+        return False
+
+    def _document_page_indexes(self) -> list[int]:
+        return list(range(self._page_count()))
+
+    def _base_canvas_image(self) -> Image.Image:
+        width, height = self._canvas_size_px()
+        return Image.new("1", (width, height), 255)
+
+    def _base_fit_result(self):
+        from .imaging import FitResult
+
+        width, height = self._canvas_size_px()
+        return FitResult(self._base_canvas_image(), (0, 0, width, height))
+
+    def _document_title(self) -> str:
+        return "Projeto em branco" if self.blank_document else "Documento"
 
     def open_text_window(self, overlay: dict[str, object] | None = None) -> None:
-        if not self.page_sources:
-            messagebox.showinfo("Camadas", "Abra um arquivo antes de adicionar texto.")
+        if not self._open_text_window_requires_document():
             return
         if hasattr(self, "text_window") and self.text_window.winfo_exists():
             self.text_window.lift()
@@ -767,16 +1525,20 @@ class ThermalLabelApp:
         editing = overlay is not None
         window = tk.Toplevel(self.root)
         window.title("Editar texto" if editing else "Texto")
-        window.geometry("420x280")
-        window.minsize(420, 280)
+        window.geometry("560x520")
+        window.minsize(520, 460)
         window.transient(self.root)
-        window.grab_set()
         window.configure(bg="#f1f3f4")
         self.text_window = window
 
         width, height = self._canvas_size_px()
         text_var = tk.StringVar(value=str(overlay.get("text", "")) if overlay else "")
         size_var = tk.IntVar(value=int(overlay.get("font_size", max(18, round(height * 0.035)))) if overlay else max(18, round(height * 0.035)))
+        family_var = tk.StringVar(value=str(overlay.get("font_family", self.layer_font_family.get())) if overlay else self.layer_font_family.get())
+        bold_var = tk.BooleanVar(value=bool(overlay.get("bold", self.layer_bold.get())) if overlay else bool(self.layer_bold.get()))
+        italic_var = tk.BooleanVar(value=bool(overlay.get("italic", self.layer_italic.get())) if overlay else bool(self.layer_italic.get()))
+        color_var = tk.StringVar(value=str(overlay.get("color", self.layer_color.get())) if overlay else self.layer_color.get())
+        align_var = tk.StringVar(value=str(overlay.get("align", self.layer_align.get())) if overlay else self.layer_align.get())
         status_var = tk.StringVar(value="Duplo clique na camada para editar depois.")
 
         container = ttk.Frame(window, padding=12, style="App.TFrame")
@@ -791,16 +1553,33 @@ class ThermalLabelApp:
         text_entry.grid(row=0, column=1, sticky="ew", pady=5)
         ttk.Label(form, text="Tamanho").grid(row=1, column=0, sticky="w", pady=5, padx=(0, 10))
         ttk.Spinbox(form, from_=6, to=300, increment=1, textvariable=size_var, width=14).grid(row=1, column=1, sticky="w", pady=5)
+        ttk.Label(form, text="Fonte").grid(row=2, column=0, sticky="w", pady=5, padx=(0, 10))
+        ttk.Combobox(form, textvariable=family_var, values=self._font_family_values(), width=22).grid(row=2, column=1, sticky="ew", pady=5)
+        ttk.Label(form, text="Alinhamento").grid(row=3, column=0, sticky="w", pady=5, padx=(0, 10))
+        ttk.Combobox(form, textvariable=align_var, values=["left", "center", "right"], state="readonly", width=14).grid(row=3, column=1, sticky="w", pady=5)
+        ttk.Checkbutton(form, text="Negrito", variable=bold_var).grid(row=4, column=0, sticky="w", pady=5)
+        ttk.Checkbutton(form, text="Itálico", variable=italic_var).grid(row=4, column=1, sticky="w", pady=5)
+        color_row = ttk.Frame(form, style="App.TFrame")
+        color_row.grid(row=5, column=0, columnspan=2, sticky="ew", pady=5)
+        ttk.Button(color_row, text="Cor", command=lambda: self._choose_text_color(color_var)).pack(side="left")
+        ttk.Label(color_row, textvariable=color_var, style="Value.TLabel").pack(side="left", padx=(8, 0))
         form.columnconfigure(1, weight=1)
 
         ttk.Label(container, textvariable=status_var, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
         actions = ttk.Frame(container, style="App.TFrame")
         actions.pack(fill="x", side="bottom", pady=(14, 0))
         ttk.Button(actions, text="Cancelar", width=14, command=window.destroy).pack(side="right")
-        ttk.Button(actions, text="Salvar", width=14, style="Accent.TButton", command=lambda: self.save_text_overlay_from_window(window, overlay, text_var, size_var, status_var)).pack(side="right", padx=(0, 8))
+        ttk.Button(actions, text="Salvar", width=14, style="Accent.TButton", command=lambda: self.save_text_overlay_from_window(window, overlay, text_var, size_var, status_var, family_var, bold_var, italic_var, color_var, align_var)).pack(side="right", padx=(0, 8))
         window.bind("<Escape>", lambda _event: window.destroy())
-        window.bind("<Return>", lambda _event: self.save_text_overlay_from_window(window, overlay, text_var, size_var, status_var))
+        window.bind("<Return>", lambda _event: self.save_text_overlay_from_window(window, overlay, text_var, size_var, status_var, family_var, bold_var, italic_var, color_var, align_var))
         text_entry.focus_set()
+        self._finish_dialog(window, 560, 520)
+        window.grab_set()
+
+    def _choose_text_color(self, color_var: tk.StringVar) -> None:
+        color = colorchooser.askcolor(color=color_var.get(), title="Cor do texto")
+        if color and color[1]:
+            color_var.set(color[1])
 
     def save_text_overlay_from_window(
         self,
@@ -809,6 +1588,11 @@ class ThermalLabelApp:
         text_var: tk.StringVar,
         size_var: tk.IntVar,
         status_var: tk.StringVar,
+        family_var: tk.StringVar,
+        bold_var: tk.BooleanVar,
+        italic_var: tk.BooleanVar,
+        color_var: tk.StringVar,
+        align_var: tk.StringVar,
     ) -> None:
         text = text_var.get().strip()
         if not text:
@@ -830,6 +1614,12 @@ class ThermalLabelApp:
                 "w": max(120, round(width * 0.35)),
                 "h": max(44, font_size + 12),
                 "font_size": font_size,
+                "font_family": family_var.get(),
+                "bold": bool(bold_var.get()),
+                "italic": bool(italic_var.get()),
+                "color": color_var.get(),
+                "align": align_var.get(),
+                "rotation": 0,
             }
             self._current_overlays().append(overlay)
             self.status_message.set("Texto adicionado como camada.")
@@ -838,13 +1628,20 @@ class ThermalLabelApp:
             overlay["font_size"] = font_size
             overlay["h"] = max(float(overlay.get("h", 44)), font_size + 12)
             self.status_message.set("Texto atualizado.")
+        overlay["name"] = str(text[:24] or "Texto")
+        overlay["font_family"] = family_var.get()
+        overlay["bold"] = bool(bold_var.get())
+        overlay["italic"] = bool(italic_var.get())
+        overlay["color"] = color_var.get()
+        overlay["align"] = align_var.get()
+        self._autosize_text_overlay(overlay)
         self.selected_overlay_id = str(overlay["id"])
         window.destroy()
+        self._sync_layer_panel()
         self.schedule_preview()
 
     def add_image_overlay(self) -> None:
-        if not self.page_sources:
-            messagebox.showinfo("Camadas", "Abra um arquivo antes de adicionar imagem.")
+        if not self._require_document_for_layer():
             return
         path = filedialog.askopenfilename(
             title="Adicionar imagem",
@@ -870,77 +1667,87 @@ class ThermalLabelApp:
         overlay = {
             "id": self._new_overlay_id(),
             "type": "image",
+            "name": source.name,
             "path": str(source),
             "x": round(width * 0.1),
             "y": round(height * 0.1),
             "w": overlay_w,
             "h": overlay_h,
+            "rotation": 0,
         }
         self._current_overlays().append(overlay)
         self.selected_overlay_id = str(overlay["id"])
         self.status_message.set("Imagem adicionada como camada.")
+        self._sync_layer_panel()
         self.schedule_preview()
 
     def open_counter_window(self, overlay: dict[str, object] | None = None) -> None:
-        if not self.page_sources:
-            messagebox.showinfo("Camadas", "Abra um arquivo antes de adicionar numeração.")
+        if not self._require_document_for_layer():
             return
         if hasattr(self, "counter_window") and self.counter_window.winfo_exists():
-            self.counter_window.lift()
-            return
+            if self.counter_window.winfo_children():
+                self.counter_window.lift()
+                return
+            self.counter_window.destroy()
 
         editing = overlay is not None
         window = tk.Toplevel(self.root)
-        window.title("Editar numeração" if editing else "Numeração")
-        window.geometry("420x330")
-        window.minsize(420, 330)
-        window.transient(self.root)
-        window.grab_set()
-        window.configure(bg="#f1f3f4")
         self.counter_window = window
+        window.withdraw()
+        try:
+            window.title("Editar numeração" if editing else "Numeração")
+            window.geometry("520x460")
+            window.minsize(500, 420)
+            window.transient(self.root)
+            window.configure(bg="#f1f3f4")
 
-        start_var = tk.IntVar(value=int(overlay.get("start", 1)) if overlay else 1)
-        end_var = tk.IntVar(value=int(overlay.get("end", 1500)) if overlay else 1500)
-        digits_var = tk.IntVar(value=int(overlay.get("digits", 0)) if overlay else 0)
-        prefix_var = tk.StringVar(value=str(overlay.get("prefix", "")) if overlay else "")
-        suffix_var = tk.StringVar(value=str(overlay.get("suffix", "")) if overlay else "")
-        size_var = tk.IntVar(value=int(overlay.get("font_size", 28)) if overlay else 28)
-        status_var = tk.StringVar(value="A camada será criada na página atual.")
+            start_var = tk.IntVar(value=int(overlay.get("start", 1)) if overlay else 1)
+            end_var = tk.IntVar(value=int(overlay.get("end", 1500)) if overlay else 1500)
+            digits_var = tk.IntVar(value=int(overlay.get("digits", 0)) if overlay else 0)
+            prefix_var = tk.StringVar(value=str(overlay.get("prefix", "")) if overlay else "")
+            suffix_var = tk.StringVar(value=str(overlay.get("suffix", "")) if overlay else "")
+            size_var = tk.IntVar(value=int(overlay.get("font_size", 28)) if overlay else 28)
+            status_var = tk.StringVar(value="A camada será criada na página atual.")
 
-        container = ttk.Frame(window, padding=12, style="App.TFrame")
-        container.pack(fill="both", expand=True)
-        ttk.Label(container, text="Numeração", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(container, text="Crie comandas/etiquetas sequenciais.", style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
+            container = ttk.Frame(window, padding=12, style="App.TFrame")
+            container.pack(fill="both", expand=True)
+            ttk.Label(container, text="Numeração", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(container, text="Crie comandas/etiquetas sequenciais.", style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
 
-        form = ttk.Frame(container, style="App.TFrame")
-        form.pack(fill="x")
-        ttk.Label(form, text="Início").grid(row=0, column=0, sticky="w", pady=5, padx=(0, 10))
-        ttk.Spinbox(form, from_=0, to=999999, increment=1, textvariable=start_var, width=14).grid(row=0, column=1, sticky="w", pady=5)
-        ttk.Label(form, text="Fim").grid(row=1, column=0, sticky="w", pady=5, padx=(0, 10))
-        ttk.Spinbox(form, from_=0, to=999999, increment=1, textvariable=end_var, width=14).grid(row=1, column=1, sticky="w", pady=5)
-        ttk.Label(form, text="Zeros").grid(row=2, column=0, sticky="w", pady=5, padx=(0, 10))
-        ttk.Spinbox(form, from_=0, to=12, increment=1, textvariable=digits_var, width=14).grid(row=2, column=1, sticky="w", pady=5)
-        ttk.Label(form, text="Prefixo").grid(row=3, column=0, sticky="w", pady=5, padx=(0, 10))
-        ttk.Entry(form, textvariable=prefix_var).grid(row=3, column=1, sticky="ew", pady=5)
-        ttk.Label(form, text="Sufixo").grid(row=4, column=0, sticky="w", pady=5, padx=(0, 10))
-        ttk.Entry(form, textvariable=suffix_var).grid(row=4, column=1, sticky="ew", pady=5)
-        ttk.Label(form, text="Tamanho").grid(row=5, column=0, sticky="w", pady=5, padx=(0, 10))
-        ttk.Spinbox(form, from_=6, to=300, increment=1, textvariable=size_var, width=14).grid(row=5, column=1, sticky="w", pady=5)
-        form.columnconfigure(1, weight=1)
+            form = ttk.Frame(container, style="App.TFrame")
+            form.pack(fill="x")
+            ttk.Label(form, text="Início").grid(row=0, column=0, sticky="w", pady=5, padx=(0, 10))
+            ttk.Spinbox(form, from_=0, to=999999, increment=1, textvariable=start_var, width=14).grid(row=0, column=1, sticky="w", pady=5)
+            ttk.Label(form, text="Fim").grid(row=1, column=0, sticky="w", pady=5, padx=(0, 10))
+            ttk.Spinbox(form, from_=0, to=999999, increment=1, textvariable=end_var, width=14).grid(row=1, column=1, sticky="w", pady=5)
+            ttk.Label(form, text="Zeros").grid(row=2, column=0, sticky="w", pady=5, padx=(0, 10))
+            ttk.Spinbox(form, from_=0, to=12, increment=1, textvariable=digits_var, width=14).grid(row=2, column=1, sticky="w", pady=5)
+            ttk.Label(form, text="Prefixo").grid(row=3, column=0, sticky="w", pady=5, padx=(0, 10))
+            ttk.Entry(form, textvariable=prefix_var).grid(row=3, column=1, sticky="ew", pady=5)
+            ttk.Label(form, text="Sufixo").grid(row=4, column=0, sticky="w", pady=5, padx=(0, 10))
+            ttk.Entry(form, textvariable=suffix_var).grid(row=4, column=1, sticky="ew", pady=5)
+            ttk.Label(form, text="Tamanho").grid(row=5, column=0, sticky="w", pady=5, padx=(0, 10))
+            ttk.Spinbox(form, from_=6, to=300, increment=1, textvariable=size_var, width=14).grid(row=5, column=1, sticky="w", pady=5)
+            form.columnconfigure(1, weight=1)
 
-        ttk.Label(container, textvariable=status_var, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
-        actions = ttk.Frame(container, style="App.TFrame")
-        actions.pack(fill="x", side="bottom", pady=(14, 0))
-        ttk.Button(actions, text="Cancelar", width=14, command=window.destroy).pack(side="right")
-        ttk.Button(
-            actions,
-            text="Salvar" if editing else "Criar",
-            width=14,
-            style="Accent.TButton",
-            command=lambda: self.add_counter_overlay_from_window(window, overlay, start_var, end_var, digits_var, prefix_var, suffix_var, size_var, status_var),
-        ).pack(side="right", padx=(0, 8))
-        window.bind("<Escape>", lambda _event: window.destroy())
-        window.bind("<Return>", lambda _event: self.add_counter_overlay_from_window(window, overlay, start_var, end_var, digits_var, prefix_var, suffix_var, size_var, status_var))
+            ttk.Label(container, textvariable=status_var, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
+            actions = ttk.Frame(container, style="App.TFrame")
+            actions.pack(fill="x", side="bottom", pady=(14, 0))
+            ttk.Button(actions, text="Cancelar", width=14, command=window.destroy).pack(side="right")
+            ttk.Button(
+                actions,
+                text="Salvar" if editing else "Criar",
+                width=14,
+                style="Accent.TButton",
+                command=lambda: self.add_counter_overlay_from_window(window, overlay, start_var, end_var, digits_var, prefix_var, suffix_var, size_var, status_var),
+            ).pack(side="right", padx=(0, 8))
+            window.bind("<Escape>", lambda _event: window.destroy())
+            window.bind("<Return>", lambda _event: self.add_counter_overlay_from_window(window, overlay, start_var, end_var, digits_var, prefix_var, suffix_var, size_var, status_var))
+            self._finish_dialog(window, 520, 460)
+            window.grab_set()
+        except Exception as exc:
+            window.destroy()
+            messagebox.showerror("Numeração", f"Não foi possível abrir o formulário:\n{exc}")
 
     def add_counter_overlay_from_window(
         self,
@@ -973,10 +1780,12 @@ class ThermalLabelApp:
             overlay = {
                 "id": self._new_overlay_id(),
                 "type": "counter",
+                "name": "Numeracao",
                 "x": round(width * 0.1),
                 "y": round(height * 0.1),
                 "w": max(120, round(width * 0.3)),
                 "h": max(48, font_size + 12),
+                "rotation": 0,
             }
             self._current_overlays().append(overlay)
             self.status_message.set(f"Numeração criada: {start} até {end}.")
@@ -989,8 +1798,10 @@ class ThermalLabelApp:
         overlay["suffix"] = suffix_var.get()
         overlay["font_size"] = font_size
         overlay["h"] = max(float(overlay.get("h", 48)), font_size + 12)
+        self._autosize_text_overlay(overlay)
         self.selected_overlay_id = str(overlay["id"])
         window.destroy()
+        self._sync_layer_panel()
         self.schedule_preview()
 
     def delete_selected_overlay(self) -> None:
@@ -1000,10 +1811,12 @@ class ThermalLabelApp:
         remaining = [overlay for overlay in overlays if overlay.get("id") != self.selected_overlay_id]
         if len(remaining) == len(overlays):
             return
+        self._record_overlay_history()
         self.page_overlays[self.current_index] = remaining
         self.selected_overlay_id = None
         self.overlay_drag_start = None
         self.status_message.set("Camada removida.")
+        self._sync_layer_panel()
         self.schedule_preview()
 
     def _selected_overlay(self) -> dict[str, object] | None:
@@ -1025,6 +1838,9 @@ class ThermalLabelApp:
             self.open_counter_window(overlay)
         elif overlay.get("type") == "image":
             messagebox.showinfo("Camadas", "Imagem ainda permite mover/remover. Edição de imagem fica para a próxima etapa.")
+        elif overlay.get("type") == "shape" and overlay.get("shape") in {"barcode", "qrcode"}:
+            self._show_sidebar_tab("Camadas")
+            self.status_message.set("Edite o conteúdo em Propriedades > Texto / dados e clique em Aplicar.")
 
     def _overlay_canvas_box(self, overlay: dict[str, object]) -> tuple[float, float, float, float] | None:
         if not self.preview_image_box:
@@ -1040,6 +1856,8 @@ class ThermalLabelApp:
 
     def _overlay_at(self, x: int, y: int) -> dict[str, object] | None:
         for overlay in reversed(self._current_overlays()):
+            if not overlay.get("visible", True):
+                continue
             box = self._overlay_canvas_box(overlay)
             if not box:
                 continue
@@ -1047,6 +1865,56 @@ class ThermalLabelApp:
             if x1 <= x <= x2 and y1 <= y <= y2:
                 return overlay
         return None
+
+    def _overlay_handle_at(self, overlay: dict[str, object], x: int, y: int) -> str | None:
+        box = self._overlay_canvas_box(overlay)
+        if not box:
+            return None
+        x1, y1, x2, y2 = box
+        handles = {"se": (x2, y2), "rotate": ((x1 + x2) / 2, y1 - 24)}
+        for name, (hx, hy) in handles.items():
+            if abs(x - hx) <= 16 and abs(y - hy) <= 16:
+                return name
+        return None
+
+    def _begin_overlay_handle_action(self, overlay: dict[str, object], handle: str, event) -> bool:
+        if overlay.get("locked"):
+            self.status_message.set("Camada bloqueada.")
+            return True
+        self.selected_overlay_id = str(overlay["id"])
+        scale = max(self.preview_scale, 0.01)
+        self._record_overlay_history()
+        if handle == "se":
+            self.overlay_resize_start = (
+                event.x,
+                event.y,
+                float(overlay.get("w", 1)),
+                float(overlay.get("h", 1)),
+                scale,
+                int(overlay.get("font_size", 24)),
+                float(overlay.get("x", 0)),
+                float(overlay.get("y", 0)),
+            )
+            self.preview_canvas.configure(cursor="sizing")
+            self._sync_layer_panel()
+            self._draw_selection_overlay()
+            return True
+        if handle == "rotate":
+            self.overlay_rotate_start = (
+                event.x,
+                event.y,
+                float(overlay.get("rotation", 0)),
+                float(overlay.get("x", 0)),
+                float(overlay.get("y", 0)),
+                float(overlay.get("w", 1)),
+                float(overlay.get("h", 1)),
+                scale,
+            )
+            self.preview_canvas.configure(cursor="exchange")
+            self._sync_layer_panel()
+            self._draw_selection_overlay()
+            return True
+        return False
 
     def _toggle_preview_mode(self, _event=None) -> None:
         self.edit_mode.set("Rotacionar" if self.edit_mode.get() == "Redimensionar" else "Redimensionar")
@@ -1084,17 +1952,40 @@ class ThermalLabelApp:
         return None
 
     def _start_preview_action(self, event) -> None:
-        if not self.page_sources:
+        if not self._has_document():
             return
+        if self.active_tool.get() == "text":
+            self._create_text_at_event(event)
+            self.set_active_tool("select")
+            return
+        if self.active_tool.get() in {"rect", "ellipse", "line", "barcode", "qrcode"}:
+            self._create_shape_at_event(event, self.active_tool.get())
+            return
+        selected_overlay = self._selected_overlay()
+        if selected_overlay:
+            selected_handle = self._overlay_handle_at(selected_overlay, event.x, event.y)
+            if selected_handle and self._begin_overlay_handle_action(selected_overlay, selected_handle, event):
+                return
         overlay = self._overlay_at(event.x, event.y)
         if overlay:
+            if overlay.get("locked"):
+                self.status_message.set("Camada bloqueada.")
+                return
             self.selected_overlay_id = str(overlay["id"])
             scale = max(self.preview_scale, 0.01)
+            handle = self._overlay_handle_at(overlay, event.x, event.y)
+            if handle and self._begin_overlay_handle_action(overlay, handle, event):
+                self._sync_layer_panel()
+                self._draw_selection_overlay()
+                return
+            self._record_overlay_history()
             self.overlay_drag_start = (event.x, event.y, float(overlay.get("x", 0)), float(overlay.get("y", 0)), scale)
             self.preview_canvas.configure(cursor="fleur")
+            self._sync_layer_panel()
             self._draw_selection_overlay()
             return
         self.selected_overlay_id = None
+        self._sync_layer_panel()
         handle = self._preview_handle_at(event.x, event.y)
         if self.edit_mode.get() == "Rotacionar":
             self._begin_interactive_adjustment()
@@ -1119,7 +2010,7 @@ class ThermalLabelApp:
             self.preview_canvas.configure(cursor="fleur")
 
     def _drag_preview_action(self, event) -> None:
-        if not self.page_sources:
+        if not self._has_document():
             return
         if self.rotate_start:
             start_x, start_y, start_angle = self.rotate_start
@@ -1154,8 +2045,59 @@ class ThermalLabelApp:
             start_x, start_y, overlay_x, overlay_y, scale = self.overlay_drag_start
             for overlay in self._current_overlays():
                 if overlay.get("id") == self.selected_overlay_id:
-                    overlay["x"] = round(overlay_x + (event.x - start_x) / scale)
-                    overlay["y"] = round(overlay_y + (event.y - start_y) / scale)
+                    overlay["x"] = round(self._snap_value(overlay_x + (event.x - start_x) / scale))
+                    overlay["y"] = round(self._snap_value(overlay_y + (event.y - start_y) / scale))
+                    self._sync_layer_panel(update_module=False, update_list=False)
+                    self.schedule_preview()
+                    return
+        if self.overlay_resize_start and self.selected_overlay_id:
+            start_x, start_y, start_w, start_h, scale, start_font_size, start_overlay_x, start_overlay_y = self.overlay_resize_start
+            for overlay in self._current_overlays():
+                if overlay.get("id") == self.selected_overlay_id:
+                    dx = (event.x - start_x) / scale
+                    dy = (event.y - start_y) / scale
+                    from_center = bool(event.state & 0x0004)
+                    aspect_locked = overlay.get("shape") in {"qrcode"} or bool(event.state & 0x0001)
+                    raw_w = start_w + (dx * 2 if from_center else dx)
+                    raw_h = start_h + (dy * 2 if from_center else dy)
+                    if aspect_locked:
+                        side = max(4, max(raw_w, raw_h))
+                        raw_w = raw_h = side
+                    new_w = max(4, round(self._snap_value(raw_w)))
+                    new_h = max(4, round(self._snap_value(raw_h)))
+                    if from_center:
+                        overlay["x"] = round(self._snap_value(start_overlay_x - (new_w - start_w) / 2), 2)
+                        overlay["y"] = round(self._snap_value(start_overlay_y - (new_h - start_h) / 2), 2)
+                    if overlay.get("type") in {"text", "counter"}:
+                        ratio_w = new_w / max(1, start_w)
+                        ratio_h = new_h / max(1, start_h)
+                        ratio = (ratio_w + ratio_h) / 2 if event.state & 0x0001 else max(ratio_w, ratio_h)
+                        new_font_size = max(6, min(600, round(start_font_size * ratio)))
+                        overlay["font_size"] = new_font_size
+                        overlay["h"] = max(new_h, new_font_size + 12)
+                        overlay["w"] = new_w
+                    else:
+                        overlay["w"] = new_w
+                        overlay["h"] = new_h
+                    self._sync_layer_panel(update_module=False, update_list=False)
+                    self.schedule_preview()
+                    return
+        if self.overlay_rotate_start and self.selected_overlay_id:
+            _sx, _sy, start_angle, ox, oy, ow, oh, scale = self.overlay_rotate_start
+            for overlay in self._current_overlays():
+                if overlay.get("id") == self.selected_overlay_id:
+                    box = self._overlay_canvas_box(overlay)
+                    if not box:
+                        return
+                    cx = (box[0] + box[2]) / 2
+                    cy = (box[1] + box[3]) / 2
+                    a0 = math.degrees(math.atan2(_sy - cy, _sx - cx))
+                    a1 = math.degrees(math.atan2(event.y - cy, event.x - cx))
+                    angle = (start_angle + a1 - a0) % 360
+                    if event.state & 0x0004:
+                        angle = round(angle / 15) * 15
+                    overlay["rotation"] = round(angle, 1)
+                    self._sync_layer_panel(update_module=False, update_list=False)
                     self.schedule_preview()
                     return
 
@@ -1165,6 +2107,8 @@ class ThermalLabelApp:
         self.resize_start = None
         self.rotate_start = None
         self.overlay_drag_start = None
+        self.overlay_resize_start = None
+        self.overlay_rotate_start = None
         if had_interactive_adjustment:
             self._commit_interactive_adjustment()
         self.preview_canvas.configure(cursor="")
@@ -1176,9 +2120,18 @@ class ThermalLabelApp:
         return (x1 + x2) / 2, (y1 + y2) / 2
 
     def _update_preview_cursor(self, event) -> None:
-        if not self.page_sources:
+        if not self._has_document():
             return
-        if self._overlay_at(event.x, event.y):
+        point = self._canvas_point_from_event(event)
+        if point:
+            dpi = max(1, int(self.dpi.get()))
+            self.mouse_position.set(f"Mouse: {px_to_mm(round(point[0]), dpi):.1f} mm, {px_to_mm(round(point[1]), dpi):.1f} mm | Zoom {int(self.zoom_percent.get())}%")
+        selected_overlay = self._selected_overlay()
+        if selected_overlay and self._overlay_handle_at(selected_overlay, event.x, event.y) == "se":
+            self.preview_canvas.configure(cursor="sizing")
+        elif selected_overlay and self._overlay_handle_at(selected_overlay, event.x, event.y) == "rotate":
+            self.preview_canvas.configure(cursor="exchange")
+        elif self._overlay_at(event.x, event.y):
             self.preview_canvas.configure(cursor="fleur")
         elif self.edit_mode.get() == "Rotacionar" and self._point_in_preview_box(event.x, event.y):
             self.preview_canvas.configure(cursor="exchange")
@@ -1188,6 +2141,12 @@ class ThermalLabelApp:
             self.preview_canvas.configure(cursor="fleur")
         else:
             self.preview_canvas.configure(cursor="")
+
+    def _on_canvas_zoom(self, event) -> None:
+        if event.state & 0x0004:
+            delta = 10 if event.delta > 0 else -10
+            self.zoom_percent.set(max(25, min(400, int(self.zoom_percent.get()) + delta)))
+            self.schedule_preview()
 
     def _bind_auto_preview(self) -> None:
         self.dpi.trace_add("write", lambda *_args: self._on_dpi_changed())
@@ -1252,6 +2211,8 @@ class ThermalLabelApp:
 
     def _reset_edit_history(self) -> None:
         self.edit_history.reset(self._current_page_adjustment())
+        self.overlay_undo_stack.clear()
+        self.overlay_redo_stack.clear()
         self._update_history_buttons()
 
     def _record_edit_history(self) -> None:
@@ -1261,10 +2222,12 @@ class ThermalLabelApp:
         self._update_history_buttons()
 
     def _update_history_buttons(self) -> None:
+        can_undo = self.edit_history.can_undo or bool(self.overlay_undo_stack)
+        can_redo = self.edit_history.can_redo or bool(self.overlay_redo_stack)
         if hasattr(self, "undo_button"):
-            self.undo_button.configure(state="normal" if self.edit_history.can_undo else "disabled")
+            self.undo_button.configure(state="normal" if can_undo else "disabled")
         if hasattr(self, "redo_button"):
-            self.redo_button.configure(state="normal" if self.edit_history.can_redo else "disabled")
+            self.redo_button.configure(state="normal" if can_redo else "disabled")
 
     def _begin_interactive_adjustment(self) -> None:
         self.edit_history.begin_batch(self._current_page_adjustment())
@@ -1284,6 +2247,8 @@ class ThermalLabelApp:
         self.schedule_preview()
 
     def undo_edit(self) -> None:
+        if self.undo_overlay_edit():
+            return
         previous = self.edit_history.undo(self._current_page_adjustment())
         if previous is None:
             self.status_message.set("Nada para desfazer")
@@ -1296,6 +2261,8 @@ class ThermalLabelApp:
         self.status_message.set("Ajuste desfeito")
 
     def redo_edit(self) -> None:
+        if self.redo_overlay_edit():
+            return
         next_adjustment = self.edit_history.redo(self._current_page_adjustment())
         if next_adjustment is None:
             self.status_message.set("Nada para refazer")
@@ -1308,12 +2275,12 @@ class ThermalLabelApp:
         self.status_message.set("Ajuste refeito")
 
     def _save_current_page_adjustment(self) -> None:
-        if not self.page_sources or self.loading_page_settings:
+        if not self._has_document() or self.loading_page_settings:
             return
         self.page_adjustments[self.current_index] = self._current_page_adjustment()
 
     def _load_page_adjustment(self) -> None:
-        if not self.page_sources:
+        if not self._has_document():
             return
         adjustment = self.page_adjustments.get(self.current_index)
         default_adjustment = self.default_page_adjustment or self._current_page_adjustment()
@@ -1348,6 +2315,14 @@ class ThermalLabelApp:
         )
 
     def on_close(self) -> None:
+        self.app_settings.last_printer = self.printer_name.get()
+        self.app_settings.last_output_mode = self.output_mode.get()
+        self.app_settings.last_project = str(self.project_path or "")
+        self.app_settings.preferences["snap_enabled"] = bool(self.snap_enabled.get())
+        self.app_settings.preferences["grid_size"] = int(self.grid_size.get())
+        self.app_settings.preferences["show_grid"] = bool(self.show_grid.get())
+        self.app_settings.preferences["show_rulers"] = bool(self.show_rulers.get())
+        save_settings(self.app_settings)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         self.root.destroy()
 
@@ -1412,10 +2387,9 @@ class ThermalLabelApp:
 
         window = tk.Toplevel(self.root)
         window.title("Novo perfil")
-        window.geometry("460x340")
-        window.minsize(460, 340)
+        window.geometry("520x430")
+        window.minsize(500, 390)
         window.transient(self.root)
-        window.grab_set()
         window.configure(bg="#f1f3f4")
         self.profile_window = window
 
@@ -1454,6 +2428,8 @@ class ThermalLabelApp:
         window.bind("<Escape>", lambda _event: window.destroy())
         window.bind("<Return>", lambda _event: self.save_profile_from_window(window, name_var, width_var, height_var, dpi_var, margin_var, status_var))
         name_entry.focus_set()
+        self._finish_dialog(window, 520, 430)
+        window.grab_set()
 
     def save_profile_from_window(
         self,
@@ -1649,14 +2625,133 @@ class ThermalLabelApp:
         if paths:
             self.load_files([normalize_input_path(path) for path in paths])
 
+    def new_blank_project(self) -> None:
+        self.page_sources = []
+        self.project_source_files = []
+        self.blank_document = True
+        self.current_index = 0
+        self.page_adjustments = {0: self._current_page_adjustment()}
+        self.page_overlays = {}
+        self.selected_overlay_id = None
+        self.overlay_drag_start = None
+        self.overlay_resize_start = None
+        self.overlay_rotate_start = None
+        self.project_path = None
+        self.default_page_adjustment = self._current_page_adjustment()
+        self._reset_edit_history()
+        self._sync_layer_panel()
+        self._show_sidebar_tab("Camadas")
+        self.status_message.set("Novo projeto em branco criado.")
+        self.refresh_preview()
+
+    def _build_project(self) -> YnixProject:
+        layers_by_page = {
+            page: [Layer.from_overlay(normalize_overlay(overlay)) for overlay in overlays]
+            for page, overlays in self.page_overlays.items()
+        }
+        return YnixProject(
+            canvas=CanvasSpec(self.width_mm, self.height_mm, max(1, int(self.dpi.get()))),
+            layers_by_page=layers_by_page,
+            source_files=list(self.project_source_files or self.page_sources),
+            page_adjustments={int(page): dict(data) for page, data in self.page_adjustments.items()},
+            settings={
+                "profile_name": self.profile_name.get(),
+                "fit_mode": self.fit_mode.get(),
+                "snap_enabled": bool(self.snap_enabled.get()),
+                "grid_size": int(self.grid_size.get()),
+                "blank_document": bool(self.blank_document),
+            },
+            print_config=PrintConfig(
+                printer_name=self.printer_name.get(),
+                output_mode=self.output_mode.get(),
+                quality=self.print_quality.get(),
+                invert=bool(self.invert.get()),
+            ),
+        )
+
+    def save_project(self) -> None:
+        if self.project_path is None:
+            self.save_project_as()
+            return
+        try:
+            save_project(self._build_project(), self.project_path)
+        except Exception as exc:
+            messagebox.showerror("Projeto", f"Não foi possível salvar o projeto:\n{exc}")
+            return
+        self.status_message.set(f"Projeto salvo: {self.project_path.name}")
+
+    def save_project_as(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Salvar projeto Ynix",
+            defaultextension=".ynix",
+            filetypes=[("Projeto Ynix", "*.ynix"), ("JSON", "*.json"), ("Todos", "*.*")],
+        )
+        if not path:
+            return
+        self.project_path = Path(path)
+        self.save_project()
+
+    def open_project(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Abrir projeto Ynix",
+            filetypes=[("Projeto Ynix", "*.ynix"), ("JSON", "*.json"), ("Todos", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            project = load_project(Path(path))
+        except Exception as exc:
+            messagebox.showerror("Projeto", f"Não foi possível abrir o projeto:\n{exc}")
+            return
+        self.project_path = Path(path)
+        self._apply_project(project)
+
+    def _apply_project(self, project: YnixProject) -> None:
+        opened_path = self.project_path
+        self.syncing = True
+        try:
+            self.width_mm = project.canvas.width_mm
+            self.height_mm = project.canvas.height_mm
+            self.dpi.set(project.canvas.dpi)
+            self.size_unit.set("mm")
+            self._sync_size_fields_from_mm()
+            if project.print_config:
+                self.printer_name.set(project.print_config.printer_name)
+                self.output_mode.set(project.print_config.output_mode)
+                self.print_quality.set(project.print_config.quality)
+                self.invert.set(project.print_config.invert)
+            self.snap_enabled.set(bool(project.settings.get("snap_enabled", self.snap_enabled.get())))
+            self.grid_size.set(int(project.settings.get("grid_size", self.grid_size.get())))
+        finally:
+            self.syncing = False
+        sources = [path for path in project.source_files if path.is_file()]
+        if sources:
+            self.load_files(sources)
+        else:
+            self.new_blank_project()
+            self.blank_document = bool(project.settings.get("blank_document", True))
+        self.project_path = opened_path
+        self.page_adjustments = {int(page): dict(data) for page, data in project.page_adjustments.items()}
+        self.page_overlays = {
+            int(page): [layer.to_overlay() for layer in layers]
+            for page, layers in project.layers_by_page.items()
+        }
+        self.selected_overlay_id = None
+        self._load_page_adjustment()
+        self._sync_layer_panel()
+        self.refresh_preview()
+        self.status_message.set(f"Projeto aberto: {self.project_path.name if self.project_path else ''}")
+
     def load_files(self, files: list[Path]) -> None:
         self.page_sources = []
+        self.blank_document = False
         self.current_index = 0
         self.page_adjustments = {}
         self.page_overlays = {}
         self.selected_overlay_id = None
         self.overlay_drag_start = None
         files = [normalize_input_path(file) for file in files]
+        self.project_source_files = list(files)
         skipped = [file for file in files if file.suffix.lower() not in SUPPORTED_SUFFIXES]
         files = [file for file in files if file.is_file() and file.suffix.lower() in SUPPORTED_SUFFIXES]
         for pdf_page in self.tmpdir.glob("*.png"):
@@ -1681,7 +2776,7 @@ class ThermalLabelApp:
         self.refresh_preview()
 
     def prev_page(self) -> None:
-        if not self.page_sources:
+        if not self._has_document():
             return
         self._save_current_page_adjustment()
         self.current_index = max(0, self.current_index - 1)
@@ -1690,31 +2785,108 @@ class ThermalLabelApp:
         self.refresh_preview()
 
     def next_page(self) -> None:
-        if not self.page_sources:
+        if not self._has_document():
             return
         self._save_current_page_adjustment()
-        self.current_index = min(len(self.page_sources) - 1, self.current_index + 1)
+        self.current_index = min(self._page_count() - 1, self.current_index + 1)
         self.selected_overlay_id = None
         self._load_page_adjustment()
         self.refresh_preview()
 
     def _current_fitted(self):
-        if not self.page_sources:
+        if not self._has_document():
             return None
+        if self.blank_document:
+            return self._apply_overlays(self._base_canvas_image(), self.current_index)
         src = open_mono(self.page_sources[self.current_index])
         return self._apply_overlays(fit_image(src, self.current_render_settings()), self.current_index)
 
     def _fitted_for_index(self, index: int):
+        if self.blank_document:
+            return self._base_canvas_image()
         src = open_mono(self.page_sources[index])
         return fit_image(src, self.render_settings_for_index(index))
 
-    def _font_for_size(self, size: int) -> ImageFont.ImageFont:
-        for font_path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+    def _font_for_size(self, size: int, family: str = "DejaVu Sans", bold: bool = False, italic: bool = False) -> ImageFont.ImageFont:
+        style = ""
+        if bold:
+            style += "Bold"
+        if italic:
+            style += "Oblique"
+        candidates = []
+        if family:
+            compact = family.replace(" ", "")
+            candidates.extend(
+                [
+                    f"/usr/share/fonts/truetype/dejavu/{compact}-{style}.ttf",
+                    f"/usr/share/fonts/truetype/dejavu/{compact}.ttf",
+                    f"/usr/share/fonts/truetype/liberation2/{compact}-{style}.ttf",
+                    f"/usr/share/fonts/truetype/liberation2/{compact}.ttf",
+                ]
+            )
+        candidates.extend(
+            [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf" if bold and italic else "",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf" if italic else "",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ]
+        )
+        for font_path in candidates:
+            if not font_path:
+                continue
             try:
                 return ImageFont.truetype(font_path, size)
             except OSError:
                 continue
         return ImageFont.load_default()
+
+    def _measure_overlay_text(self, overlay: dict[str, object]) -> tuple[int, int]:
+        font_size = max(6, int(overlay.get("font_size", 24)))
+        font = self._font_for_size(
+            font_size,
+            str(overlay.get("font_family", "DejaVu Sans")),
+            bool(overlay.get("bold", False)),
+            bool(overlay.get("italic", False)),
+        )
+        if overlay.get("type") == "counter":
+            text = self._format_counter_overlay(overlay)
+        else:
+            text = str(overlay.get("text", ""))
+        probe = Image.new("L", (1, 1), 255)
+        draw = ImageDraw.Draw(probe)
+        try:
+            box = draw.multiline_textbbox((0, 0), text or " ", font=font, spacing=4)
+            return max(1, box[2] - box[0]), max(1, box[3] - box[1])
+        except Exception:
+            return max(1, len(text) * font_size // 2), max(1, font_size)
+
+    def _autosize_text_overlay(self, overlay: dict[str, object], padding: int = 10) -> None:
+        if overlay.get("type") not in {"text", "counter"}:
+            return
+        text_w, text_h = self._measure_overlay_text(overlay)
+        width_px, height_px = self._canvas_size_px()
+        x = max(0, float(overlay.get("x", 0)))
+        y = max(0, float(overlay.get("y", 0)))
+        desired_w = min(max(4, width_px - x), text_w + padding * 2)
+        desired_h = min(max(4, height_px - y), text_h + padding * 2)
+        overlay["w"] = max(float(overlay.get("w", 1)), desired_w)
+        overlay["h"] = max(float(overlay.get("h", 1)), desired_h)
+
+    def _text_fill_for_overlay(self, overlay: dict[str, object]) -> int:
+        color = str(overlay.get("color", "#000000"))
+        return self._mono_from_color(color)
+
+    def _mono_from_color(self, color: str, default: int = 0) -> int:
+        if color.startswith("#") and len(color) == 7:
+            try:
+                r = int(color[1:3], 16)
+                g = int(color[3:5], 16)
+                b = int(color[5:7], 16)
+                return 0 if (r * 0.299 + g * 0.587 + b * 0.114) < 180 else 255
+            except ValueError:
+                pass
+        return default
 
     def _format_counter_overlay(self, overlay: dict[str, object], value: int | None = None) -> str:
         number = int(overlay.get("start", 1) if value is None else value)
@@ -1731,16 +2903,46 @@ class ThermalLabelApp:
     def _apply_overlays(self, img: Image.Image, index: int, counter_value: int | None = None) -> Image.Image:
         canvas = img.convert("L")
         for overlay in self.page_overlays.get(index, []):
+            if not overlay.get("visible", True):
+                continue
             x = round(float(overlay.get("x", 0)))
             y = round(float(overlay.get("y", 0)))
             w = max(1, round(float(overlay.get("w", 1))))
             h = max(1, round(float(overlay.get("h", 1))))
+            opacity = max(0, min(100, int(float(overlay.get("opacity", 100)))))
+            if opacity <= 0:
+                continue
             if overlay.get("type") in {"text", "counter"}:
-                draw = ImageDraw.Draw(canvas)
+                layer_img = Image.new("L", (w, h), 255)
+                draw = ImageDraw.Draw(layer_img)
                 font_size = max(6, int(overlay.get("font_size", 24)))
-                font = self._font_for_size(font_size)
+                font = self._font_for_size(
+                    font_size,
+                    str(overlay.get("font_family", "DejaVu Sans")),
+                    bool(overlay.get("bold", False)),
+                    bool(overlay.get("italic", False)),
+                )
                 text = self._format_counter_overlay(overlay, counter_value) if overlay.get("type") == "counter" else str(overlay.get("text", ""))
-                draw.multiline_text((x, y), text, fill=0, font=font, spacing=4)
+                align = str(overlay.get("align", "left"))
+                fill = self._text_fill_for_overlay(overlay)
+                if align == "center":
+                    anchor_x = w / 2
+                    anchor = "ma"
+                elif align == "right":
+                    anchor_x = w
+                    anchor = "ra"
+                else:
+                    anchor_x = 0
+                    anchor = "la"
+                draw.multiline_text((anchor_x, 0), text, fill=fill, font=font, spacing=4, align=align, anchor=anchor)
+                angle = float(overlay.get("rotation", 0))
+                if angle:
+                    layer_img = layer_img.rotate(-angle, expand=True, fillcolor=255)
+                if overlay.get("flip_x"):
+                    layer_img = ImageOps.mirror(layer_img)
+                if overlay.get("flip_y"):
+                    layer_img = ImageOps.flip(layer_img)
+                canvas.paste(layer_img, (x, y))
             elif overlay.get("type") == "image":
                 path = Path(str(overlay.get("path", "")))
                 if not path.is_file():
@@ -1750,7 +2952,72 @@ class ThermalLabelApp:
                 except Exception:
                     continue
                 layer = layer.resize((w, h), Image.Resampling.LANCZOS).convert("1").convert("L")
+                angle = float(overlay.get("rotation", 0))
+                if angle:
+                    layer = layer.rotate(-angle, expand=True, fillcolor=255)
+                if overlay.get("flip_x"):
+                    layer = ImageOps.mirror(layer)
+                if overlay.get("flip_y"):
+                    layer = ImageOps.flip(layer)
                 canvas.paste(layer, (x, y))
+            elif overlay.get("type") == "shape":
+                layer = Image.new("L", (w, h), 255)
+                mask = Image.new("1", (w, h), 0)
+                draw = ImageDraw.Draw(layer)
+                mask_draw = ImageDraw.Draw(mask)
+                stroke = self._mono_from_color(str(overlay.get("stroke_color", overlay.get("color", "#000000"))), 0)
+                fill_color = str(overlay.get("fill_color", "none"))
+                has_fill = fill_color not in {"", "none", "None", "transparent"}
+                fill = self._mono_from_color(fill_color, 255) if has_fill else None
+                line_width = max(1, int(overlay.get("line_width", 3)))
+                shape = str(overlay.get("shape", "rect"))
+                inset = max(0, line_width // 2)
+                if shape == "ellipse":
+                    bbox = (inset, inset, max(inset, w - inset - 1), max(inset, h - inset - 1))
+                    draw.ellipse(bbox, outline=stroke, fill=fill, width=line_width)
+                    mask_draw.ellipse(bbox, outline=1, fill=1 if has_fill else 0, width=line_width)
+                elif shape == "line":
+                    y_mid = h // 2
+                    draw.line((0, y_mid, max(0, w - 1), y_mid), fill=stroke, width=line_width)
+                    mask_draw.line((0, y_mid, max(0, w - 1), y_mid), fill=1, width=line_width)
+                elif shape == "barcode":
+                    data = str(overlay.get("data", "YNIX"))
+                    digest = hashlib.sha256(data.encode("utf-8")).digest()
+                    cursor = 4
+                    index = 0
+                    while cursor < w - 4:
+                        bar_w = 1 + digest[index % len(digest)] % 5
+                        gap = 1 + digest[(index + 7) % len(digest)] % 3
+                        rect = (cursor, 0, min(w, cursor + bar_w), h)
+                        draw.rectangle(rect, fill=stroke)
+                        mask_draw.rectangle(rect, fill=1)
+                        cursor += bar_w + gap
+                        index += 1
+                elif shape == "qrcode":
+                    result = render_qrcode_layer(
+                        str(overlay.get("data", "YNIX")),
+                        (w, h),
+                        stroke=stroke,
+                        fill=normalize_qr_fill(fill_color, self._mono_from_color),
+                        module_scale=line_width,
+                    )
+                    layer = result.layer
+                    mask = result.mask
+                else:
+                    bbox = (inset, inset, max(inset, w - inset - 1), max(inset, h - inset - 1))
+                    draw.rectangle(bbox, outline=stroke, fill=fill, width=line_width)
+                    mask_draw.rectangle(bbox, outline=1, fill=1 if has_fill else 0, width=line_width)
+                angle = float(overlay.get("rotation", 0))
+                if angle:
+                    layer = layer.rotate(-angle, expand=True, fillcolor=255)
+                    mask = mask.rotate(-angle, expand=True, fillcolor=0)
+                if overlay.get("flip_x"):
+                    layer = ImageOps.mirror(layer)
+                    mask = ImageOps.mirror(mask)
+                if overlay.get("flip_y"):
+                    layer = ImageOps.flip(layer)
+                    mask = ImageOps.flip(mask)
+                canvas.paste(layer, (x, y), mask)
         return canvas.convert("1")
 
     def _composed_for_index(self, index: int, counter_value: int | None = None) -> Image.Image:
@@ -1763,32 +3030,37 @@ class ThermalLabelApp:
 
     def refresh_preview(self) -> None:
         self.preview_job = None
-        if not self.page_sources:
+        if not self._has_document():
             self.page_info.configure(text="Página 0/0")
             self.preview_image_box = None
             self.preview_content_box = None
-            self._draw_empty_preview("Arraste um PDF/imagem para cá ou use Abrir arquivos.")
-            self.status_message.set("Abra um PDF ou imagem para começar")
+            self._draw_empty_preview("Novo projeto em branco ou arraste um PDF/imagem.")
+            self.status_message.set("Crie um projeto em branco ou abra um arquivo para começar")
             return
 
-        src = open_mono(self.page_sources[self.current_index])
-        result = fit_image_with_meta(src, self.current_render_settings())
+        if self.blank_document:
+            result = self._base_fit_result()
+        else:
+            src = open_mono(self.page_sources[self.current_index])
+            result = fit_image_with_meta(src, self.current_render_settings())
         img = self._apply_overlays(result.image, self.current_index)
         self.preview_image = img
 
         available_w = max(240, self.preview_canvas.winfo_width() - 20)
         available_h = max(240, self.preview_canvas.winfo_height() - 20)
-        ratio = min(available_w / img.width, available_h / img.height, 1.0)
+        ratio = min(available_w / img.width, available_h / img.height, 1.0) * max(10, int(self.zoom_percent.get())) / 100
         self.preview_scale = ratio
         show_size = (max(1, round(img.width * ratio)), max(1, round(img.height * ratio)))
         resampling = Image.Resampling.LANCZOS if ratio < 1 else Image.Resampling.NEAREST
         show = img.convert("L").resize(show_size, resampling)
-        show = ImageOps.expand(show, border=2, fill=80)
+        show = ImageOps.expand(show, border=1, fill=180)
         self.preview_tk = ImageTk.PhotoImage(show)
         canvas_w = self.preview_canvas.winfo_width()
         canvas_h = self.preview_canvas.winfo_height()
-        x = max(0, (canvas_w - show.width) // 2)
-        y = max(0, (canvas_h - show.height) // 2)
+        ruler_left = 34 if self.show_rulers.get() else 0
+        ruler_top = 22 if self.show_rulers.get() else 0
+        x = max(ruler_left + 16, (canvas_w - show.width + ruler_left) // 2)
+        y = max(ruler_top + 16, (canvas_h - show.height + ruler_top) // 2)
         self.preview_image_box = (x, y, x + show.width, y + show.height)
         border = 2
         bx1, by1, bx2, by2 = result.content_box
@@ -1803,9 +3075,12 @@ class ThermalLabelApp:
             y + border + by2 * ratio,
         )
         self.preview_canvas.delete("all")
+        self.preview_canvas.create_rectangle(x + 7, y + 8, x + show.width + 7, y + show.height + 8, fill="#151515", outline="", tags=("workspace",))
         self.preview_canvas.create_image(x, y, image=self.preview_tk, anchor="nw", tags=("preview_image",))
+        self._draw_workspace_guides()
         self._draw_selection_overlay()
-        self.page_info.configure(text=f"Página {self.current_index + 1}/{len(self.page_sources)}")
+        self._sync_layer_panel(update_module=False)
+        self.page_info.configure(text=f"Página {self.current_index + 1}/{self._page_count()}")
 
     def _draw_empty_preview(self, text: str) -> None:
         self.preview_canvas.delete("all")
@@ -1817,6 +3092,68 @@ class ThermalLabelApp:
             font=("DejaVu Sans", 11),
             width=max(200, self.preview_canvas.winfo_width() - 80),
         )
+
+    def _draw_workspace_guides(self) -> None:
+        self.preview_canvas.delete("workspace")
+        if not self.preview_image_box:
+            return
+        x1, y1, x2, y2 = self.preview_image_box
+        border = 1
+        label_x1 = x1 + border
+        label_y1 = y1 + border
+        label_x2 = x2 - border
+        label_y2 = y2 - border
+        scale = max(self.preview_scale, 0.01)
+        width_px, height_px = self._canvas_size_px()
+        if self.show_grid.get():
+            dpi = max(1, int(self.dpi.get()))
+            minor_step = max(mm_to_px(5, dpi), int(self.grid_size.get()))
+            major_step = max(minor_step, mm_to_px(25, dpi))
+            for gx in range(0, width_px + 1, minor_step):
+                x = label_x1 + gx * scale
+                if label_x1 <= x <= label_x2:
+                    self.preview_canvas.create_line(x, label_y1, x, label_y2, fill="#eef2f5", tags=("workspace",))
+            for gy in range(0, height_px + 1, minor_step):
+                y = label_y1 + gy * scale
+                if label_y1 <= y <= label_y2:
+                    self.preview_canvas.create_line(label_x1, y, label_x2, y, fill="#eef2f5", tags=("workspace",))
+            for gx in range(0, width_px + 1, major_step):
+                x = label_x1 + gx * scale
+                if label_x1 <= x <= label_x2:
+                    self.preview_canvas.create_line(x, label_y1, x, label_y2, fill="#dde6ee", tags=("workspace",))
+            for gy in range(0, height_px + 1, major_step):
+                y = label_y1 + gy * scale
+                if label_y1 <= y <= label_y2:
+                    self.preview_canvas.create_line(label_x1, y, label_x2, y, fill="#dde6ee", tags=("workspace",))
+            cx = label_x1 + width_px * scale / 2
+            cy = label_y1 + height_px * scale / 2
+            self.preview_canvas.create_line(cx, label_y1, cx, label_y2, fill="#b8cdf8", dash=(6, 6), tags=("workspace",))
+            self.preview_canvas.create_line(label_x1, cy, label_x2, cy, fill="#b8cdf8", dash=(6, 6), tags=("workspace",))
+        else:
+            cx = label_x1 + width_px * scale / 2
+            cy = label_y1 + height_px * scale / 2
+            tick = 8
+            self.preview_canvas.create_line(cx - tick, cy, cx + tick, cy, fill="#d6dce2", tags=("workspace",))
+            self.preview_canvas.create_line(cx, cy - tick, cx, cy + tick, fill="#d6dce2", tags=("workspace",))
+        if self.show_rulers.get():
+            top = max(0, label_y1 - 20)
+            left = max(0, label_x1 - 30)
+            self.preview_canvas.create_rectangle(label_x1, top, label_x2, label_y1 - 3, fill="#242628", outline="", tags=("workspace",))
+            self.preview_canvas.create_rectangle(left, label_y1, label_x1 - 3, label_y2, fill="#242628", outline="", tags=("workspace",))
+            mark_step = 25 if self.width_mm > 80 else 10
+            for mm in range(0, int(self.width_mm) + 1, mark_step):
+                x = label_x1 + mm_to_px(mm, max(1, int(self.dpi.get()))) * scale
+                if x <= label_x2:
+                    self.preview_canvas.create_line(x, label_y1 - 8, x, label_y1 - 3, fill="#9aa0a6", tags=("workspace",))
+                    if mm:
+                        self.preview_canvas.create_text(x + 3, label_y1 - 14, text=str(mm), fill="#cfd3d7", anchor="w", font=("DejaVu Sans", 7), tags=("workspace",))
+            mark_step_y = 25 if self.height_mm > 80 else 10
+            for mm in range(0, int(self.height_mm) + 1, mark_step_y):
+                y = label_y1 + mm_to_px(mm, max(1, int(self.dpi.get()))) * scale
+                if y <= label_y2:
+                    self.preview_canvas.create_line(label_x1 - 8, y, label_x1 - 3, y, fill="#9aa0a6", tags=("workspace",))
+                    if mm:
+                        self.preview_canvas.create_text(label_x1 - 27, y + 2, text=str(mm), fill="#cfd3d7", anchor="w", font=("DejaVu Sans", 7), tags=("workspace",))
 
     def _draw_selection_overlay(self) -> None:
         self.preview_canvas.delete("selection")
@@ -1859,6 +3196,11 @@ class ThermalLabelApp:
             self.preview_canvas.create_rectangle(ox1, oy1, ox2, oy2, outline=outline, width=2 if selected else 1, dash=dash, tags=("selection",))
             if selected:
                 self.preview_canvas.create_text(ox1, max(12, oy1 - 14), text="Camada", fill=outline, anchor="w", tags=("selection",))
+                self.preview_canvas.create_rectangle(ox2 - 7, oy2 - 7, ox2 + 7, oy2 + 7, fill="#ffffff", outline=outline, width=2, tags=("selection",))
+                rx = (ox1 + ox2) / 2
+                ry = oy1 - 24
+                self.preview_canvas.create_line(rx, oy1, rx, ry, fill=outline, width=2, tags=("selection",))
+                self.preview_canvas.create_oval(rx - 7, ry - 7, rx + 7, ry + 7, fill="#ffffff", outline=outline, width=2, tags=("selection",))
 
     def _payload_for_index(self, index: int, counter_value: int | None = None) -> bytes:
         img = self._composed_for_index(index, counter_value)
@@ -1878,8 +3220,29 @@ class ThermalLabelApp:
         img.save(out, format="PNG")
         return out.getvalue()
 
+    def export_current(self, fmt: str) -> None:
+        if not self._has_document():
+            return
+        suffix = ".pdf" if fmt == "pdf" else ".png"
+        path = filedialog.asksaveasfilename(
+            title=f"Exportar {fmt.upper()}",
+            defaultextension=suffix,
+            filetypes=[(fmt.upper(), f"*{suffix}"), ("Todos", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            img = self._composed_for_index(self.current_index).convert("RGB")
+            if fmt == "pdf":
+                img.save(path, "PDF", resolution=max(1, int(self.dpi.get())))
+            else:
+                img.save(path, "PNG")
+            self.status_message.set(f"Exportado: {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("Exportar", str(exc))
+
     def _enqueue_print_job(self, title: str, indexes: list[int]) -> None:
-        if not self.page_sources:
+        if not self._has_document():
             return
         if not indexes:
             messagebox.showwarning("Impressão térmica", "Nenhuma página selecionada para impressão.")
@@ -1902,7 +3265,7 @@ class ThermalLabelApp:
             messagebox.showerror("Erro", str(exc))
 
     def print_counter_sequence(self) -> None:
-        if not self.page_sources:
+        if not self._has_document():
             return
         counter = self._counter_overlay_for_index(self.current_index)
         if not counter:
@@ -1935,14 +3298,14 @@ class ThermalLabelApp:
             messagebox.showerror("Erro", str(exc))
 
     def print_current(self) -> None:
-        if not self.page_sources:
+        if not self._has_document():
             return
         self._enqueue_print_job(f"Página {self.current_index + 1}", [self.current_index])
 
     def print_all(self) -> None:
-        if not self.page_sources:
+        if not self._has_document():
             return
-        self._enqueue_print_job("Todas as páginas", list(range(len(self.page_sources))))
+        self._enqueue_print_job("Todas as páginas", self._document_page_indexes())
 
     def _parse_page_range(self, expr: str) -> list[int]:
         expr = expr.strip()
@@ -1950,7 +3313,7 @@ class ThermalLabelApp:
             return []
 
         pages = set()
-        max_page = len(self.page_sources)
+        max_page = self._page_count()
         for part in expr.split(","):
             token = part.strip()
             if not token:
@@ -1970,7 +3333,7 @@ class ThermalLabelApp:
         return sorted(pages)
 
     def print_range(self) -> None:
-        if not self.page_sources:
+        if not self._has_document():
             return
         try:
             indexes = self._parse_page_range(self.page_range.get())

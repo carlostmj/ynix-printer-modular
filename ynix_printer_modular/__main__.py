@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from .app import ThermalLabelApp
+from .ui.main_window import create_app
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,7 +18,7 @@ def main(argv: list[str] | None = None) -> int:
         import tkinter as tk
 
         root = tk.Tk()
-    ThermalLabelApp(root, args.files)
+    create_app(root, args.files)
     root.mainloop()
     return 0
 

@@ -7,7 +7,7 @@ from queue import Empty, Queue
 from threading import Thread
 from typing import Callable
 
-from .printing import send_document, send_raw
+from .core.print_service import PrintService
 
 
 Payload = bytes
@@ -35,6 +35,7 @@ class PrintQueue:
         self._queue: Queue[PrintJob] = Queue()
         self._jobs: dict[int, PrintJob] = {}
         self._on_change = on_change
+        self._print_service = PrintService(retries=2)
         self._worker = Thread(target=self._run, daemon=True)
         self._worker.start()
 
@@ -87,12 +88,11 @@ class PrintQueue:
                         job.status = "Cancelado"
                         self._on_change(job)
                         break
-                    if job.output_mode == "normal":
-                        result = send_document(job.printer, payload)
-                    else:
-                        result = send_raw(job.printer, payload)
-                    if result:
-                        results.append(result)
+                    result = self._print_service.send(job.printer, payload, job.output_mode)
+                    if not result.ok:
+                        raise RuntimeError(f"{result.message} (tentativas: {result.attempts})")
+                    if result.message:
+                        results.append(result.message)
                 else:
                     job.status = "Concluido"
                     job.cups_result = "\n".join(results)

@@ -1,14 +1,17 @@
 # Ynix Printer Modular
 
-Aplicativo Tkinter para ajustar, pré-visualizar e imprimir com fluxo modular para térmicas e CUPS.
+Editor gráfico leve para montar, ajustar, salvar e imprimir etiquetas térmicas. O fluxo principal é: abrir PDF/imagem, editar no canvas, organizar camadas, salvar projeto `.ynix` e enviar para CUPS em modo TSPL/raw ou PNG normal.
 
-## Créditos
+## Recursos
 
-- Autor: CarlosTMJ
-- GitHub: https://github.com/carlostmj
-- Versão: 1.2.0
-- Atualizado em: 2026-05-01 19:49:53 -03
-- Ícone: `assets/icone.png`
+- Editor Tkinter com preview interativo, movimentação, redimensionamento e rotação de camadas.
+- Toolbar lateral estilo Corel com seleção, mover, texto e inserir imagem.
+- Camadas por página com z-index, duplicação, excluir, trazer para frente, enviar para trás e mover acima/abaixo.
+- Texto avançado com fonte do sistema, tamanho, negrito, itálico, cor preparada para render P&B e alinhamento.
+- Menu de contexto com editar, duplicar, ordenar e deletar.
+- Projetos `.ynix` em JSON com canvas, fontes, textos, imagens, camadas, posições, rotação, ajustes de página e configuração de impressão.
+- Impressão modular via CUPS, TSPL e fila com retry automático e logs em `~/.config/ynix-printer-modular/logs/app.log`.
+- Persistência de preferências em `~/.config/ynix-printer-modular/settings.json`.
 
 ## Rodar
 
@@ -22,37 +25,58 @@ Com arquivo inicial:
 .venv/bin/python run.py caminho/etiquetas.pdf
 ```
 
-## Observações
+## Como usar o editor
 
-- O perfil `10x15` usa `100 x 150 mm` em `203 DPI`, que é o padrão mais comum em impressoras térmicas de etiqueta.
-- A barra superior concentra as escolhas globais: perfil, impressora, tipo de impressão e qualidade.
-- A aba `Perfis` abre uma janela para criar medidas personalizadas salvas em `~/.config/ynix-printer-modular/profiles.json`.
-- A aba `Ajustes` fica dedicada ao posicionamento, escala, rotação, corte e opções do conteúdo.
-- O menu `Camadas` e os botões do topo permitem adicionar texto/imagem por cima da página atual e mover a camada no preview.
-- Texto e numeração podem ser editados com duplo clique na camada ou pelo botão `Editar camada`.
-- A camada `Numeração` gera comandas sequenciais, por exemplo de `1` a `1500`, e a aba `Impressão` envia a sequência inteira.
-- Se sua impressora for realmente 300 DPI, selecione ou ajuste o campo DPI para `300`.
-- O preview atualiza sozinho quando tamanho, DPI, margem, offset, ajuste, rotação, inversão ou perfil mudam.
-- Ajustes de conteúdo como escala, offset, ajuste e rotação ficam salvos por página.
-- O conteúdo pode ser cortado por bordas usando `Corte esq./dir./topo/baixo`.
-- A impressão é enviada em modo raw com comando TSPL (`lp -o raw`).
-- Também existe modo `Impressora normal`, que envia PNG ao CUPS sem TSPL/raw.
-- Arrastar e soltar arquivos usa `tkinterdnd2`, instalado na `.venv` do projeto.
-- A lista de impressoras vem do CUPS (`lpstat`).
-- A aba `Fila` permite acompanhar trabalhos, cancelar pendentes, reimprimir e ver erros.
-- O menu `Ferramentas > Driver Tomate / CUPS...` diagnostica a Tomate no CUPS e pode recriar a fila em modo raw com `lpadmin`.
-- A instalação segue o contrato do modelo selecionado e permite escolher manualmente fila CUPS e porta/URI quando a detecção automática não bastar.
-- Impressoras seguem contratos em `thermal_label_app/printers/contracts/` e modelos em `thermal_label_app/printers/models/`. Exemplo: `printers/models/mdk_007.py`.
+- `Abrir arquivos` carrega PDF ou imagem.
+- A toolbar esquerda troca a ferramenta ativa: seleção, mover, texto e imagem.
+- Com a ferramenta texto, clique no canvas para criar uma camada editável.
+- Clique em uma camada para selecionar e arraste para mover.
+- Use o canto inferior direito da seleção para redimensionar.
+- Use o handle circular acima da seleção para rotacionar.
+- O painel `Camadas` controla ordem, duplicação, exclusão e propriedades numéricas.
+- Ative `Snap à grade` para alinhar posições ao grid.
+
+## Projetos
+
+- `Arquivo > Salvar projeto` grava `.ynix`.
+- `Arquivo > Abrir projeto` restaura fontes, textos, imagens, posições, camadas, ajustes e impressão.
+- O formato é JSON estruturado para facilitar auditoria e integração futura.
+
+## Impressão
+
+- `Térmica TSPL` gera comando raw com `SIZE`, `GAP`, `DENSITY`, `BITMAP` e `PRINT`.
+- `Impressora normal` envia PNG ao CUPS.
+- A aba `Fila` mostra status, permite cancelar pendentes, reimprimir e abrir erro detalhado.
+- Qualidade controla velocidade e densidade TSPL.
 
 ## Atalhos
 
 - `Ctrl+O`: abrir arquivos
+- `Ctrl+Shift+O`: abrir projeto
+- `Ctrl+S`: salvar projeto
+- `Ctrl+Shift+S`: salvar projeto como
 - `Ctrl+P`: imprimir página atual
 - `Ctrl+Shift+P`: imprimir todas as páginas
 - `Ctrl+Z`: desfazer ajuste
 - `Ctrl+Y` / `Ctrl+Shift+Z`: refazer ajuste
 - `Ctrl+←` / `Ctrl+→`: navegar páginas
-- `Ctrl+R`: alternar redimensionar/rotacionar
-- `Ctrl+0`: redefinir escala e rotação
-- `Ctrl+Shift+0`: limpar corte
+- `Delete`: remover camada selecionada
 - `Esc`: cancelar ação no preview
+
+## Troubleshooting
+
+- Se `lp` não existir, instale/configure CUPS.
+- Se impressora TSPL imprimir caracteres, confirme que a fila está em modo raw.
+- Se PDF não abrir, instale `pdftoppm`/Poppler.
+- Se arrastar arquivos não funcionar, instale `tkinterdnd2`.
+- Consulte logs em `~/.config/ynix-printer-modular/logs/app.log`.
+
+## Arquitetura
+
+- `domain/`: modelos de canvas, projeto e camadas.
+- `core/`: documento, estado do canvas, transformações, overlays, print service e fila.
+- `ui/`: componentes de janela, canvas, toolbar, painel direito e menu de contexto.
+- `infrastructure/`: adapters CUPS e TSPL.
+- `storage/`: serialização `.ynix`.
+- `config/`: settings persistentes.
+- `utils/`: logger.

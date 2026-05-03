@@ -1,4 +1,4 @@
-from thermal_label_app.__main__ import main
+from ynix_printer_modular.__main__ import main
 
 
 if __name__ == "__main__":
