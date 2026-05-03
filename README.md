@@ -1,5 +1,7 @@
 # Ynix Printer Modular
 
+![Release](https://img.shields.io/badge/release-v1.0.0.0-blue)
+
 Editor gráfico leve para montar, ajustar, salvar e imprimir etiquetas térmicas. O fluxo principal é: abrir PDF/imagem, editar no canvas, organizar camadas, salvar projeto `.ynix` e enviar para CUPS em modo TSPL/raw ou PNG normal.
 
 ## Recursos
