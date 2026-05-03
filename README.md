@@ -13,6 +13,13 @@ Editor gráfico leve para montar, ajustar, salvar e imprimir etiquetas térmicas
 - Impressão modular via CUPS, TSPL e fila com retry automático e logs em `~/.config/ynix-printer-modular/logs/app.log`.
 - Persistência de preferências em `~/.config/ynix-printer-modular/settings.json`.
 
+## Metadados
+
+- Autor: CarlosTMJ
+- GitHub: https://github.com/carlostmj
+- Versão: 1.0.0.0
+- Ícone: `assets/icone.png`
+
 ## Rodar
 
 ```bash
