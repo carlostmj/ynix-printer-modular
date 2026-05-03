@@ -1,6 +1,6 @@
 from PIL import Image
 
-from thermal_label_app.tspl import build_tspl
+from ynix_printer_modular.tspl import build_tspl
 
 
 def test_build_tspl_contains_expected_header_and_payload() -> None:

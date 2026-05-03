@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from thermal_label_app.domain.layer import Layer
-from thermal_label_app.domain.models import CanvasSpec, PrintConfig
-from thermal_label_app.domain.project import YnixProject
-from thermal_label_app.storage.project_serializer import load_project, save_project
+from ynix_printer_modular.domain.layer import Layer
+from ynix_printer_modular.domain.models import CanvasSpec, PrintConfig
+from ynix_printer_modular.domain.project import YnixProject
+from ynix_printer_modular.storage.project_serializer import load_project, save_project
 
 
 def test_project_roundtrip(tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-from thermal_label_app.core.qrcode_renderer import render_qrcode_layer
+from ynix_printer_modular.core.qrcode_renderer import render_qrcode_layer
 
 
 def _count_dark(image) -> int:

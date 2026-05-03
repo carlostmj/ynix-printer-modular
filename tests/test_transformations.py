@@ -1,5 +1,5 @@
-from thermal_label_app.core.transformations import move, resize, rotate, scale
-from thermal_label_app.domain.models import Transform
+from ynix_printer_modular.core.transformations import move, resize, rotate, scale
+from ynix_printer_modular.domain.models import Transform
 
 
 def test_move_with_snap() -> None:
